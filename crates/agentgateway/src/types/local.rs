@@ -477,6 +477,7 @@ fn default_matches() -> Vec<RouteMatch> {
 		path: PathMatch::PathPrefix("/".into()),
 		method: None,
 		query: vec![],
+		selector: None,
 	}]
 }
 
@@ -1039,6 +1040,7 @@ async fn convert_route(
 			weight: b.weight,
 			backend: bref,
 			inline_policies: policies,
+			metadata: HashMap::new(),
 		};
 		backend_refs.push(bref);
 		external_backends.extend_from_slice(&backends);

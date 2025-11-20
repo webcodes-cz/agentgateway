@@ -57,6 +57,7 @@ impl TryFrom<&proto::agent::RouteBackend> for RouteBackendReference {
 			weight: s.weight as usize,
 			backend,
 			inline_policies,
+			metadata: HashMap::new(),
 		})
 	}
 }
@@ -661,6 +662,7 @@ impl TryFrom<&proto::agent::RouteMatch> for RouteMatch {
 			path,
 			method,
 			query,
+			selector: None,
 		})
 	}
 }

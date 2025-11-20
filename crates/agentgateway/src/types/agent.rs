@@ -234,6 +234,10 @@ pub struct RouteMatch {
 	pub method: Option<MethodMatch>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub query: Vec<QueryMatch>,
+	/// Optional CEL expression for advanced backend selection
+	/// Example: "request.body.max_tokens <= backend.metadata.max_tokens"
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub selector: Option<Strng>,
 }
 
 #[apply(schema!)]
@@ -325,6 +329,9 @@ pub struct RouteBackendReference {
 	pub backend: BackendReference,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub inline_policies: Vec<BackendPolicy>,
+	/// Metadata for selector evaluation (e.g., max_tokens, gpu_memory, etc.)
+	#[serde(default, skip_serializing_if = "HashMap::is_empty")]
+	pub metadata: HashMap<Strng, Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -335,6 +342,9 @@ pub struct RouteBackend {
 	pub backend: BackendWithPolicies,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub inline_policies: Vec<BackendPolicy>,
+	/// Metadata for selector evaluation (e.g., max_tokens, gpu_memory, etc.)
+	#[serde(default, skip_serializing_if = "HashMap::is_empty")]
+	pub metadata: HashMap<Strng, Value>,
 }
 
 #[allow(unused)]

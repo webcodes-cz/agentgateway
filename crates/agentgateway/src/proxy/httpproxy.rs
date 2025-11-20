@@ -39,12 +39,224 @@ use crate::transport::stream::{Extension, TCPConnectionInfo, TLSConnectionInfo};
 use crate::types::{backend, frontend};
 use crate::{ProxyInputs, store, *};
 
-fn select_backend(route: &Route, _req: &Request) -> Option<RouteBackendReference> {
-	route
-		.backends
+/// Cached parsed request body for selector evaluation
+#[derive(Debug, Clone)]
+struct ParsedRequestBody {
+	json: serde_json::Value,
+	bytes: bytes::Bytes,
+}
+
+const MAX_BODY_SIZE_FOR_SELECTORS: usize = 1024 * 1024; // 1MB
+const BODY_PARSE_TIMEOUT_MS: u64 = 50;
+
+fn select_backend(route: &Route, req: &Request) -> Option<RouteBackendReference> {
+	// Check if route has selector expressions
+	let has_selector = route.matches.iter().any(|m| m.selector.is_some());
+
+	if !has_selector {
+		// Fast path: no selectors, use simple weighted selection
+		return route
+			.backends
+			.choose_weighted(&mut rand::rng(), |b| b.weight)
+			.ok()
+			.cloned();
+	}
+
+	// Get cached parsed body (if available)
+	let parsed_body = req.extensions().get::<ParsedRequestBody>();
+
+	// Filter backends based on selector evaluation
+	let eligible: Vec<_> = route.backends.iter()
+		.filter(|backend| {
+			// Evaluate all route match selectors
+			route.matches.iter().all(|route_match| {
+				if let Some(selector_expr) = &route_match.selector {
+					evaluate_selector(selector_expr, parsed_body, backend)
+				} else {
+					true // No selector = always matches
+				}
+			})
+		})
+		.collect();
+
+	if eligible.is_empty() {
+		// Fallback: no backends matched selectors, use all backends
+		trace!("No backends matched selectors, using all backends as fallback");
+		return route
+			.backends
+			.choose_weighted(&mut rand::rng(), |b| b.weight)
+			.ok()
+			.cloned();
+	}
+
+	// Select from eligible backends using weighted random
+	eligible
 		.choose_weighted(&mut rand::rng(), |b| b.weight)
 		.ok()
 		.cloned()
+		.cloned()
+}
+
+/// Evaluate a selector expression against request body and backend metadata
+fn evaluate_selector(
+	selector_expr: &Strng,
+	parsed_body: Option<&ParsedRequestBody>,
+	backend: &RouteBackendReference,
+) -> bool {
+	// Simple selector DSL (not full CEL for now)
+	// Format: "request.body.FIELD OPERATOR backend.metadata.FIELD"
+	// Example: "request.body.max_tokens <= backend.metadata.max_tokens"
+
+	let expr = selector_expr.as_str();
+
+	// Parse expression: "request.body.max_tokens <= backend.metadata.max_tokens"
+	if let Some((left_expr, right_expr)) = parse_comparison_expr(expr) {
+		let left_value = evaluate_expr(&left_expr, parsed_body, backend);
+		let right_value = evaluate_expr(&right_expr, parsed_body, backend);
+
+		match (left_value, right_value) {
+			(Some(ExprValue::Number(l)), Some(ExprValue::Number(r))) => {
+				if expr.contains("<=") {
+					l <= r
+				} else if expr.contains(">=") {
+					l >= r
+				} else if expr.contains("<") {
+					l < r
+				} else if expr.contains(">") {
+					l > r
+				} else if expr.contains("==") {
+					(l - r).abs() < f64::EPSILON
+				} else {
+					true // Unknown operator, don't filter
+				}
+			},
+			_ => true, // Can't evaluate, don't filter out this backend
+		}
+	} else {
+		true // Can't parse selector, don't filter
+	}
+}
+
+#[derive(Debug, Clone)]
+enum ExprValue {
+	Number(f64),
+	String(String),
+}
+
+fn parse_comparison_expr(expr: &str) -> Option<(String, String)> {
+	for op in &["<=", ">=", "==", "<", ">"] {
+		if let Some(pos) = expr.find(op) {
+			let left = expr[..pos].trim().to_string();
+			let right = expr[pos + op.len()..].trim().to_string();
+			return Some((left, right));
+		}
+	}
+	None
+}
+
+fn evaluate_expr(
+	expr: &str,
+	parsed_body: Option<&ParsedRequestBody>,
+	backend: &RouteBackendReference,
+) -> Option<ExprValue> {
+	if expr.starts_with("request.body.") {
+		let field = expr.strip_prefix("request.body.")?;
+		let json = &parsed_body?.json;
+		if let Some(value) = json.get(field) {
+			if let Some(num) = value.as_i64() {
+				return Some(ExprValue::Number(num as f64));
+			} else if let Some(num) = value.as_f64() {
+				return Some(ExprValue::Number(num));
+			} else if let Some(s) = value.as_str() {
+				return Some(ExprValue::String(s.to_string()));
+			}
+		}
+	} else if expr.starts_with("backend.metadata.") {
+		let field = expr.strip_prefix("backend.metadata.")?;
+		if let Some(value) = backend.metadata.get(field) {
+			if let Some(num) = value.as_i64() {
+				return Some(ExprValue::Number(num as f64));
+			} else if let Some(num) = value.as_f64() {
+				return Some(ExprValue::Number(num));
+			} else if let Some(s) = value.as_str() {
+				return Some(ExprValue::String(s.to_string()));
+			}
+		}
+	}
+	None
+}
+
+/// Parse request body and cache it in request extensions if route has selectors
+async fn maybe_parse_body_for_selectors(
+	route: &Route,
+	req: &mut Request,
+) -> Result<(), ProxyError> {
+	// Check if any route match has a selector
+	let has_selector = route.matches.iter().any(|m| m.selector.is_some());
+	if !has_selector {
+		return Ok(()); // Fast path: no selectors, skip parsing
+	}
+
+	// Check if already parsed
+	if req.extensions().get::<ParsedRequestBody>().is_some() {
+		return Ok(());
+	}
+
+	use http_body_util::BodyExt;
+
+	// Extract body while preserving all request metadata (headers, URI, etc.)
+	let (mut parts, body) = std::mem::take(req).into_parts();
+
+	// Collect body with timeout
+	let timeout_duration = std::time::Duration::from_millis(BODY_PARSE_TIMEOUT_MS);
+	let collect_future = body.collect();
+
+	let body_bytes = match tokio::time::timeout(timeout_duration, collect_future).await {
+		Ok(Ok(collected)) => {
+			let bytes = collected.to_bytes();
+			// Check size AFTER collecting to fail fast on large bodies
+			if bytes.len() > MAX_BODY_SIZE_FOR_SELECTORS {
+				trace!(
+					"Body too large for selector parsing: {} bytes (max: {})",
+					bytes.len(),
+					MAX_BODY_SIZE_FOR_SELECTORS
+				);
+				// Reconstruct and return
+				*req = Request::from_parts(parts, crate::http::Body::from(bytes));
+				return Ok(());
+			}
+			bytes
+		},
+		Ok(Err(e)) => {
+			trace!("Failed to collect body for selector: {:?}", e);
+			// Can't reconstruct - body is consumed. Create empty body.
+			*req = Request::from_parts(parts, crate::http::Body::default());
+			return Ok(());
+		},
+		Err(_timeout) => {
+			trace!("Timeout collecting body for selectors ({:?})", timeout_duration);
+			// Can't reconstruct - body is consumed. Create empty body.
+			*req = Request::from_parts(parts, crate::http::Body::default());
+			return Ok(());
+		}
+	};
+
+	// Try to parse as JSON and cache in extensions
+	if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+		let parsed = ParsedRequestBody {
+			json,
+			bytes: body_bytes.clone(),
+		};
+		parts.extensions.insert(parsed);
+		trace!("Parsed request body for selector evaluation");
+	} else {
+		trace!("Body is not valid JSON, skipping selector evaluation");
+	}
+
+	// Reconstruct request with buffered body (preserves all metadata)
+	*req = Request::from_parts(parts, crate::http::Body::from(body_bytes));
+
+	Ok(())
 }
 
 fn apply_logging_policy_to_log(log: &mut RequestLog, lp: &frontend::LoggingPolicy) {
@@ -597,6 +809,9 @@ impl HTTPProxy {
 		)
 		.await?;
 
+		// Parse body if route has selectors (for context-window routing)
+		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req).await?;
+
 		let selected_backend =
 			select_backend(selected_route.as_ref(), &req).ok_or(ProxyError::NoValidBackends)?;
 		let selected_backend = resolve_backend(selected_backend, self.inputs.as_ref())?;
@@ -804,6 +1019,7 @@ fn resolve_backend(b: RouteBackendReference, pi: &ProxyInputs) -> Result<RouteBa
 		weight: b.weight,
 		backend,
 		inline_policies: b.inline_policies,
+		metadata: b.metadata,
 	})
 }
 

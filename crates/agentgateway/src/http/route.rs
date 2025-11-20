@@ -107,6 +107,7 @@ pub fn select_best_route(
 					port: dst.port(), // TODO: get from req
 				},
 				inline_policies: Vec::new(),
+				metadata: HashMap::new(),
 			}],
 		};
 		// If there is no route, use a default one
