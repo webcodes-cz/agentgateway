@@ -43,17 +43,32 @@ use crate::{ProxyInputs, store, *};
 #[derive(Debug, Clone)]
 struct ParsedRequestBody {
 	json: serde_json::Value,
-	bytes: bytes::Bytes,
 }
 
 const MAX_BODY_SIZE_FOR_SELECTORS: usize = 1024 * 1024; // 1MB
 const BODY_PARSE_TIMEOUT_MS: u64 = 50;
+static SELECTORS_ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+	std::env::var("AG_ENABLE_SELECTORS")
+		.map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+		.unwrap_or(false)
+});
 
 fn select_backend(route: &Route, req: &Request) -> Option<RouteBackendReference> {
+	if !*SELECTORS_ENABLED {
+		return route
+			.backends
+			.choose_weighted(&mut rand::rng(), |b| b.weight)
+			.ok()
+			.cloned();
+	}
 	// Check if route has selector expressions
-	let has_selector = route.matches.iter().any(|m| m.selector.is_some());
+	let selectors: Vec<&Strng> = route
+		.matches
+		.iter()
+		.filter_map(|m| m.selector.as_ref())
+		.collect();
 
-	if !has_selector {
+	if selectors.is_empty() {
 		// Fast path: no selectors, use simple weighted selection
 		return route
 			.backends
@@ -66,15 +81,16 @@ fn select_backend(route: &Route, req: &Request) -> Option<RouteBackendReference>
 	let parsed_body = req.extensions().get::<ParsedRequestBody>();
 
 	// Filter backends based on selector evaluation
-	let eligible: Vec<_> = route.backends.iter()
+	let eligible: Vec<_> = route
+		.backends
+		.iter()
 		.filter(|backend| {
-			// Evaluate all route match selectors
-			route.matches.iter().all(|route_match| {
-				if let Some(selector_expr) = &route_match.selector {
-					evaluate_selector(selector_expr, parsed_body, backend)
-				} else {
-					true // No selector = always matches
+			selectors.iter().all(|selector_expr| {
+				if !selector_is_valid(selector_expr) {
+					trace!("Invalid selector expression, skipping filter: {}", selector_expr);
+					return true;
 				}
+				evaluate_selector(selector_expr, parsed_body, backend)
 			})
 		})
 		.collect();
@@ -103,34 +119,30 @@ fn evaluate_selector(
 	parsed_body: Option<&ParsedRequestBody>,
 	backend: &RouteBackendReference,
 ) -> bool {
-	// Simple selector DSL (not full CEL for now)
-	// Format: "request.body.FIELD OPERATOR backend.metadata.FIELD"
-	// Example: "request.body.max_tokens <= backend.metadata.max_tokens"
-
 	let expr = selector_expr.as_str();
 
 	// Parse expression: "request.body.max_tokens <= backend.metadata.max_tokens"
-	if let Some((left_expr, right_expr)) = parse_comparison_expr(expr) {
+	if let Some((left_expr, op, right_expr)) = parse_comparison_expr(expr) {
 		let left_value = evaluate_expr(&left_expr, parsed_body, backend);
 		let right_value = evaluate_expr(&right_expr, parsed_body, backend);
 
-		match (left_value, right_value) {
-			(Some(ExprValue::Number(l)), Some(ExprValue::Number(r))) => {
-				if expr.contains("<=") {
-					l <= r
-				} else if expr.contains(">=") {
-					l >= r
-				} else if expr.contains("<") {
-					l < r
-				} else if expr.contains(">") {
-					l > r
-				} else if expr.contains("==") {
-					(l - r).abs() < f64::EPSILON
-				} else {
-					true // Unknown operator, don't filter
-				}
-			},
-			_ => true, // Can't evaluate, don't filter out this backend
+	match (left_value, right_value) {
+		(Some(ExprValue::Number(l)), Some(ExprValue::Number(r))) => match op {
+			"<=" => l <= r,
+			">=" => l >= r,
+			"<" => l < r,
+			">" => l > r,
+			"==" => (l - r).abs() < f64::EPSILON,
+			_ => true,
+		},
+		(Some(ExprValue::String(l)), Some(ExprValue::String(r))) => {
+			if op == "==" {
+				l == r
+			} else {
+				true
+			}
+		},
+		_ => true, // Can't evaluate, don't filter out this backend
 		}
 	} else {
 		true // Can't parse selector, don't filter
@@ -143,23 +155,23 @@ enum ExprValue {
 	String(String),
 }
 
-fn parse_comparison_expr(expr: &str) -> Option<(String, String)> {
-	for op in &["<=", ">=", "==", "<", ">"] {
-		if let Some(pos) = expr.find(op) {
-			let left = expr[..pos].trim().to_string();
-			let right = expr[pos + op.len()..].trim().to_string();
-			return Some((left, right));
+	fn parse_comparison_expr(expr: &str) -> Option<(String, &'static str, String)> {
+		for op in &["<=", ">=", "==", "<", ">"] {
+			if let Some(pos) = expr.find(op) {
+				let left = expr[..pos].trim().to_string();
+				let right = expr[pos + op.len()..].trim().to_string();
+				return Some((left, *op, right));
+			}
 		}
+		None
 	}
-	None
-}
 
-fn evaluate_expr(
-	expr: &str,
-	parsed_body: Option<&ParsedRequestBody>,
-	backend: &RouteBackendReference,
-) -> Option<ExprValue> {
-	if expr.starts_with("request.body.") {
+	fn evaluate_expr(
+		expr: &str,
+		parsed_body: Option<&ParsedRequestBody>,
+		backend: &RouteBackendReference,
+	) -> Option<ExprValue> {
+		if expr.starts_with("request.body.") {
 		let field = expr.strip_prefix("request.body.")?;
 		let json = &parsed_body?.json;
 		if let Some(value) = json.get(field) {
@@ -182,8 +194,16 @@ fn evaluate_expr(
 				return Some(ExprValue::String(s.to_string()));
 			}
 		}
+		}
+		None
 	}
-	None
+
+fn selector_is_valid(expr: &str) -> bool {
+	if let Some((left, _, right)) = parse_comparison_expr(expr) {
+		left.starts_with("request.body.") && right.starts_with("backend.metadata.")
+	} else {
+		false
+	}
 }
 
 /// Parse request body and cache it in request extensions if route has selectors
@@ -191,6 +211,9 @@ async fn maybe_parse_body_for_selectors(
 	route: &Route,
 	req: &mut Request,
 ) -> Result<(), ProxyError> {
+	if !*SELECTORS_ENABLED {
+		return Ok(());
+	}
 	// Check if any route match has a selector
 	let has_selector = route.matches.iter().any(|m| m.selector.is_some());
 	if !has_selector {
@@ -242,15 +265,14 @@ async fn maybe_parse_body_for_selectors(
 	};
 
 	// Try to parse as JSON and cache in extensions
-	if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-		let parsed = ParsedRequestBody {
-			json,
-			bytes: body_bytes.clone(),
-		};
-		parts.extensions.insert(parsed);
-		trace!("Parsed request body for selector evaluation");
-	} else {
-		trace!("Body is not valid JSON, skipping selector evaluation");
+		if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+			let parsed = ParsedRequestBody {
+				json,
+			};
+			parts.extensions.insert(parsed);
+			trace!("Parsed request body for selector evaluation");
+		} else {
+			trace!("Body is not valid JSON, skipping selector evaluation");
 	}
 
 	// Reconstruct request with buffered body (preserves all metadata)
@@ -1958,5 +1980,26 @@ impl OptLogger for Option<&mut RequestLog> {
 		if let Some(log) = self.as_mut() {
 			f(log)
 		}
+	}
+}
+
+#[cfg(test)]
+mod selector_tests {
+	use super::*;
+
+	#[test]
+	fn validates_selector() {
+		assert!(selector_is_valid(
+			"request.body.max_tokens <= backend.metadata.max_tokens"
+		));
+		assert!(!selector_is_valid("request.body.max_tokens"));
+	}
+
+	#[test]
+	fn parses_comparison_ops() {
+		let parsed = parse_comparison_expr("request.body.a >= backend.metadata.b").unwrap();
+		assert_eq!(parsed.1, ">=");
+		assert_eq!(parsed.0, "request.body.a");
+		assert_eq!(parsed.2, "backend.metadata.b");
 	}
 }
