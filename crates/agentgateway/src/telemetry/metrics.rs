@@ -89,6 +89,18 @@ pub struct ConnectLabels {
 	pub transport: DefaultedUnknown<RichStrng>,
 }
 
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct SelectorBodyParseLabels {
+	pub route: DefaultedUnknown<RichStrng>,
+	pub status: DefaultedUnknown<RichStrng>,
+}
+
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct SelectorEvalLabels {
+	pub route: DefaultedUnknown<RichStrng>,
+	pub outcome: DefaultedUnknown<RichStrng>,
+}
+
 type Counter = Family<HTTPLabels, counter::Counter>;
 type Histogram<T> = Family<T, prometheus_client::metrics::histogram::Histogram>;
 type TCPCounter = Family<TCPLabels, counter::Counter>;
@@ -103,6 +115,9 @@ pub struct Metrics {
 	pub requests: Counter,
 	pub request_duration: Histogram<HTTPLabels>,
 	pub response_bytes: Family<HTTPLabels, counter::Counter>,
+	pub selector_eval: Family<SelectorEvalLabels, counter::Counter>,
+	pub selector_fallback: Family<SelectorEvalLabels, counter::Counter>,
+	pub selector_body_parse: Family<SelectorBodyParseLabels, counter::Counter>,
 
 	pub mcp_requests: Family<MCPCall, counter::Counter>,
 
@@ -240,6 +255,21 @@ impl Metrics {
 				&mut registry,
 				"requests",
 				"The total number of HTTP requests sent",
+			),
+			selector_eval: build(
+				&mut registry,
+				"selector_evaluations",
+				"Total selector evaluations (outcome per route)",
+			),
+			selector_fallback: build(
+				&mut registry,
+				"selector_fallbacks",
+				"Selector fallbacks to full backend pool",
+			),
+			selector_body_parse: build(
+				&mut registry,
+				"selector_body_parse",
+				"Request body parse attempts for selector evaluation",
 			),
 			downstream_connection: build(
 				&mut registry,

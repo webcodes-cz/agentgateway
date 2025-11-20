@@ -34,6 +34,7 @@ use crate::store::{
 };
 use crate::telemetry::log;
 use crate::telemetry::log::{AsyncLog, DropOnLog, LogBody, RequestLog};
+use crate::telemetry::metrics::{Metrics, SelectorBodyParseLabels, SelectorEvalLabels};
 use crate::telemetry::trc::TraceParent;
 use crate::transport::stream::{Extension, TCPConnectionInfo, TLSConnectionInfo};
 use crate::types::{backend, frontend};
@@ -53,7 +54,11 @@ static SELECTORS_ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::n
 		.unwrap_or(false)
 });
 
-fn select_backend(route: &Route, req: &Request) -> Option<RouteBackendReference> {
+fn select_backend(
+	route: &Route,
+	req: &Request,
+	metrics: &Arc<Metrics>,
+) -> Option<RouteBackendReference> {
 	if !*SELECTORS_ENABLED {
 		return route
 			.backends
@@ -98,6 +103,20 @@ fn select_backend(route: &Route, req: &Request) -> Option<RouteBackendReference>
 	if eligible.is_empty() {
 		// Fallback: no backends matched selectors, use all backends
 		trace!("No backends matched selectors, using all backends as fallback");
+		metrics
+			.selector_eval
+			.get_or_create(&SelectorEvalLabels {
+				route: route.route_name.clone().into(),
+				outcome: "no_match".to_string().into(),
+			})
+			.inc();
+		metrics
+			.selector_fallback
+			.get_or_create(&SelectorEvalLabels {
+				route: route.route_name.clone().into(),
+				outcome: "no_match".to_string().into(),
+			})
+			.inc();
 		return route
 			.backends
 			.choose_weighted(&mut rand::rng(), |b| b.weight)
@@ -106,11 +125,21 @@ fn select_backend(route: &Route, req: &Request) -> Option<RouteBackendReference>
 	}
 
 	// Select from eligible backends using weighted random
-	eligible
+	let selected = eligible
 		.choose_weighted(&mut rand::rng(), |b| b.weight)
 		.ok()
 		.cloned()
-		.cloned()
+		.cloned();
+
+	metrics
+		.selector_eval
+		.get_or_create(&SelectorEvalLabels {
+			route: route.route_name.clone().into(),
+			outcome: "match".to_string().into(),
+		})
+		.inc();
+
+	selected
 }
 
 /// Evaluate a selector expression against request body and backend metadata
@@ -210,6 +239,7 @@ fn selector_is_valid(expr: &str) -> bool {
 async fn maybe_parse_body_for_selectors(
 	route: &Route,
 	req: &mut Request,
+	metrics: &Arc<Metrics>,
 ) -> Result<(), ProxyError> {
 	if !*SELECTORS_ENABLED {
 		return Ok(());
@@ -222,6 +252,13 @@ async fn maybe_parse_body_for_selectors(
 
 	// Check if already parsed
 	if req.extensions().get::<ParsedRequestBody>().is_some() {
+		metrics
+			.selector_body_parse
+			.get_or_create(&SelectorBodyParseLabels {
+				route: route.route_name.clone().into(),
+				status: "cached".to_string().into(),
+			})
+			.inc();
 		return Ok(());
 	}
 
@@ -246,6 +283,13 @@ async fn maybe_parse_body_for_selectors(
 				);
 				// Reconstruct and return
 				*req = Request::from_parts(parts, crate::http::Body::from(bytes));
+				metrics
+					.selector_body_parse
+					.get_or_create(&SelectorBodyParseLabels {
+						route: route.route_name.clone().into(),
+						status: "too_large".to_string().into(),
+					})
+					.inc();
 				return Ok(());
 			}
 			bytes
@@ -254,25 +298,53 @@ async fn maybe_parse_body_for_selectors(
 			trace!("Failed to collect body for selector: {:?}", e);
 			// Can't reconstruct - body is consumed. Create empty body.
 			*req = Request::from_parts(parts, crate::http::Body::default());
+			metrics
+				.selector_body_parse
+				.get_or_create(&SelectorBodyParseLabels {
+					route: route.route_name.clone().into(),
+					status: "error".to_string().into(),
+				})
+				.inc();
 			return Ok(());
 		},
 		Err(_timeout) => {
 			trace!("Timeout collecting body for selectors ({:?})", timeout_duration);
 			// Can't reconstruct - body is consumed. Create empty body.
 			*req = Request::from_parts(parts, crate::http::Body::default());
+			metrics
+				.selector_body_parse
+				.get_or_create(&SelectorBodyParseLabels {
+					route: route.route_name.clone().into(),
+					status: "timeout".to_string().into(),
+				})
+				.inc();
 			return Ok(());
 		}
 	};
 
 	// Try to parse as JSON and cache in extensions
-		if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-			let parsed = ParsedRequestBody {
-				json,
-			};
-			parts.extensions.insert(parsed);
-			trace!("Parsed request body for selector evaluation");
-		} else {
-			trace!("Body is not valid JSON, skipping selector evaluation");
+	if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+		let parsed = ParsedRequestBody {
+			json,
+		};
+		parts.extensions.insert(parsed);
+		trace!("Parsed request body for selector evaluation");
+		metrics
+			.selector_body_parse
+			.get_or_create(&SelectorBodyParseLabels {
+				route: route.route_name.clone().into(),
+				status: "success".to_string().into(),
+			})
+			.inc();
+	} else {
+		trace!("Body is not valid JSON, skipping selector evaluation");
+		metrics
+			.selector_body_parse
+			.get_or_create(&SelectorBodyParseLabels {
+				route: route.route_name.clone().into(),
+				status: "non_json".to_string().into(),
+			})
+			.inc();
 	}
 
 	// Reconstruct request with buffered body (preserves all metadata)
@@ -832,10 +904,12 @@ impl HTTPProxy {
 		.await?;
 
 		// Parse body if route has selectors (for context-window routing)
-		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req).await?;
+		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req, &self.inputs.metrics)
+			.await?;
 
 		let selected_backend =
-			select_backend(selected_route.as_ref(), &req).ok_or(ProxyError::NoValidBackends)?;
+			select_backend(selected_route.as_ref(), &req, &self.inputs.metrics)
+				.ok_or(ProxyError::NoValidBackends)?;
 		let selected_backend = resolve_backend(selected_backend, self.inputs.as_ref())?;
 		let backend_policies = get_backend_policies(
 			self.inputs.as_ref(),
