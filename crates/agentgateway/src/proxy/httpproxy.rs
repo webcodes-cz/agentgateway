@@ -2002,4 +2002,98 @@ mod selector_tests {
 		assert_eq!(parsed.0, "request.body.a");
 		assert_eq!(parsed.2, "backend.metadata.b");
 	}
+
+	#[test]
+	fn evaluates_max_tokens_selector() {
+		// Simulate a request body with max_tokens
+		let body = ParsedRequestBody {
+			json: serde_json::json!({"max_tokens": 20000}),
+		};
+
+		// Low-VRAM backend (8K max_tokens)
+		let mut low_vram = RouteBackendReference {
+			weight: 1,
+			backend: BackendReference::Invalid,
+			inline_policies: vec![],
+			metadata: std::collections::HashMap::new(),
+		};
+		low_vram.metadata.insert("max_tokens".into(), serde_json::json!(8192));
+
+		// High-VRAM backend (32K max_tokens)
+		let mut high_vram = RouteBackendReference {
+			weight: 1,
+			backend: BackendReference::Invalid,
+			inline_policies: vec![],
+			metadata: std::collections::HashMap::new(),
+		};
+		high_vram.metadata.insert("max_tokens".into(), serde_json::json!(32768));
+
+		let selector = "request.body.max_tokens <= backend.metadata.max_tokens";
+
+		// Request with 20K tokens should NOT match 8K backend
+		assert!(!evaluate_selector(&selector.into(), Some(&body), &low_vram));
+
+		// Request with 20K tokens SHOULD match 32K backend
+		assert!(evaluate_selector(&selector.into(), Some(&body), &high_vram));
+	}
+
+	#[test]
+	fn context_window_routing_integration() {
+		use std::collections::HashMap;
+
+		// Create backends with different max_tokens capabilities
+		let mut backends = vec![];
+
+		// Low-VRAM backend (4K max)
+		let mut backend_4k = RouteBackendReference {
+			weight: 100,
+			backend: BackendReference::Invalid,
+			inline_policies: vec![],
+			metadata: HashMap::new(),
+		};
+		backend_4k.metadata.insert("max_tokens".into(), serde_json::json!(4096));
+		backends.push(backend_4k);
+
+		// Mid-VRAM backend (32K max)
+		let mut backend_32k = RouteBackendReference {
+			weight: 100,
+			backend: BackendReference::Invalid,
+			inline_policies: vec![],
+			metadata: HashMap::new(),
+		};
+		backend_32k.metadata.insert("max_tokens".into(), serde_json::json!(32768));
+		backends.push(backend_32k);
+
+		let selector = "request.body.max_tokens <= backend.metadata.max_tokens";
+
+		// Test 1: Request with 20K tokens
+		let body_20k = ParsedRequestBody {
+			json: serde_json::json!({"max_tokens": 20000}),
+		};
+
+		let filtered_20k: Vec<_> = backends
+			.iter()
+			.filter(|b| evaluate_selector(&selector.into(), Some(&body_20k), b))
+			.collect();
+
+		// Should only match 32K backend (4K backend can't handle 20K)
+		assert_eq!(filtered_20k.len(), 1);
+		assert_eq!(
+			filtered_20k[0].metadata.get("max_tokens"),
+			Some(&serde_json::json!(32768))
+		);
+
+		// Test 2: Request with 2K tokens
+		let body_2k = ParsedRequestBody {
+			json: serde_json::json!({"max_tokens": 2000}),
+		};
+
+		let filtered_2k: Vec<_> = backends
+			.iter()
+			.filter(|b| evaluate_selector(&selector.into(), Some(&body_2k), b))
+			.collect();
+
+		// Should match BOTH backends (both can handle 2K)
+		assert_eq!(filtered_2k.len(), 2);
+	}
 }

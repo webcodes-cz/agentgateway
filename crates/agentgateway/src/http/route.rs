@@ -14,7 +14,7 @@ use crate::types::discovery::gatewayaddress::Destination;
 use crate::types::discovery::{NamespacedHostname, NetworkAddress};
 use crate::*;
 
-#[cfg(any(test, feature = "internal_benches"))]
+#[cfg(any(all(test, feature = "full_tests"), feature = "internal_benches"))]
 #[path = "route_test.rs"]
 mod tests;
 

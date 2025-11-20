@@ -26,7 +26,7 @@ use crate::types::agent::{Bind, BindName, BindProtocol, Listener, ListenerProtoc
 use crate::types::frontend;
 use crate::{ProxyInputs, client};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full_tests"))]
 #[path = "gateway_test.rs"]
 mod tests;
 

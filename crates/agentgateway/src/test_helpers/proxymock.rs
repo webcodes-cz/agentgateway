@@ -165,6 +165,7 @@ pub fn basic_named_route(target: Strng) -> Route {
 			path: PathMatch::PathPrefix("/".into()),
 			method: None,
 			query: vec![],
+			selector: None,
 		}],
 		inline_policies: Default::default(),
 		rule_name: None,
@@ -172,6 +173,7 @@ pub fn basic_named_route(target: Strng) -> Route {
 			weight: 1,
 			backend: BackendReference::Backend(target),
 			inline_policies: Default::default(),
+			metadata: std::collections::HashMap::new(),
 		}],
 	}
 }

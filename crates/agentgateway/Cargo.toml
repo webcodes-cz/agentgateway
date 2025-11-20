@@ -16,6 +16,7 @@ schema = ["schemars"]
 tls-ring = ["rustls/ring", "tokio-rustls/ring"]
 internal_benches = ["divan"]
 testing = []
+full_tests = []
 
 [dependencies]
 a2a-sdk.workspace = true

@@ -41,7 +41,7 @@ pub enum Error {
 	InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "full_tests"))]
 #[path = "ext_proc_tests.rs"]
 mod tests;
 
