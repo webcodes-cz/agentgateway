@@ -13,9 +13,18 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use rand::Rng;
 use rand::seq::IndexedRandom;
+use aes::Aes128;
+use base64::engine::general_purpose::URL_SAFE;
+use base64::Engine;
+use cbc::Decryptor;
+use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use tracing::{debug, trace};
 use types::agent::*;
 use types::discovery::*;
+use once_cell::sync::Lazy;
 
 use crate::client::Transport;
 use crate::http::backendtls::BackendTLS;
@@ -59,6 +68,82 @@ fn select_backend(
 	req: &Request,
 	metrics: &Arc<Metrics>,
 ) -> Option<RouteBackendReference> {
+	// If JWT contains project_id and BYOK backends are present, prefer only those BYOK backends
+	let project_claim = req
+		.extensions()
+		.get::<crate::http::jwt::Claims>()
+		.and_then(|c| c.inner.get("project_id"))
+		.and_then(|v| v.as_str());
+
+	if let Some(project_id) = project_claim {
+		// Debug: log all backends and their metadata for BYOK matching
+		debug!(
+			project_id,
+			total_backends = route.backends.len(),
+			"BYOK routing: checking backends for project_id match"
+		);
+		for (i, b) in route.backends.iter().enumerate() {
+			let meta = &b.metadata;
+			let provider = meta
+				.get("provider")
+				.and_then(|v| v.as_str())
+				.unwrap_or("<none>");
+			let pid = meta
+				.get("project_id")
+				.and_then(|v| v.as_str())
+				.unwrap_or("<none>");
+			debug!(
+				backend_idx = i,
+				provider,
+				backend_project_id = pid,
+				expected_project_id = project_id,
+				is_byok = provider.ends_with("_byok"),
+				pid_match = pid == project_id,
+				"BYOK routing: backend metadata"
+			);
+		}
+
+		let byok_backends: Vec<&RouteBackendReference> = route
+			.backends
+			.iter()
+			.filter(|b| {
+				let meta = &b.metadata;
+				let provider = meta
+					.get("provider")
+					.and_then(|v| v.as_str())
+					.unwrap_or_default();
+				if !provider.ends_with("_byok") {
+					return false;
+				}
+				let pid = meta
+					.get("project_id")
+					.and_then(|v| v.as_str())
+					.unwrap_or_default();
+				pid == project_id
+			})
+			.collect();
+
+		if !byok_backends.is_empty() {
+			debug!(
+				project_id,
+				total_byok = byok_backends.len(),
+				"BYOK routing: found matching BYOK backends for project"
+			);
+			return byok_backends
+				.choose_weighted(&mut rand::rng(), |b| b.weight)
+				.ok()
+				.cloned()
+				.cloned();
+		} else {
+			debug!(
+				project_id,
+				"BYOK routing: no BYOK backends matched project_id, falling back to regular selection"
+			);
+		}
+	} else {
+		debug!("BYOK routing: no project_id claim on request; using regular selection");
+	}
+
 	if !*SELECTORS_ENABLED {
 		return route
 			.backends
@@ -1061,6 +1146,7 @@ impl HTTPProxy {
 			self.inputs.clone(),
 			route_policies.clone(),
 			&selected_backend.backend.backend,
+			Some(&selected_backend.metadata),
 			backend_policies,
 			req,
 			Some(log),
@@ -1264,6 +1350,7 @@ async fn make_backend_call(
 	inputs: Arc<ProxyInputs>,
 	route_policies: Arc<store::LLMRequestPolicies>,
 	backend: &Backend,
+	backend_metadata: Option<&HashMap<Strng, serde_json::Value>>,
 	base_policies: BackendPolicies,
 	mut req: Request,
 	mut log: Option<&mut RequestLog>,
@@ -1306,6 +1393,16 @@ async fn make_backend_call(
 			l.backend_protocol = Some(bp)
 		}
 	});
+
+	// BYOK injection: replace Authorization header with provider key when hitting BYOK backends.
+	if let Err(e) = inject_byok_if_needed(
+		&inputs,
+		backend_metadata,
+		&mut req,
+		log.as_deref_mut(),
+	) {
+		return Err(ProxyResponse::from(e));
+	}
 
 	let mut maybe_inference = policies.build_inference(policy_client.clone());
 	let (override_dest, ext_proc_resp) = maybe_inference.mutate_request(&mut req).await?;
@@ -2025,6 +2122,7 @@ impl PolicyClient {
 				self.inputs.clone(),
 				Arc::new(LLMRequestPolicies::default()),
 				&backend,
+				None,
 				pols,
 				req,
 				None,
@@ -2055,6 +2153,131 @@ impl OptLogger for Option<&mut RequestLog> {
 			f(log)
 		}
 	}
+}
+
+// -------------------------------------------------------------------------------------------------
+// BYOK helpers (pure Rust Fernet)
+// -------------------------------------------------------------------------------------------------
+#[derive(Clone, Debug)]
+struct FernetKeys {
+	signing: [u8; 16],
+	encryption: [u8; 16],
+}
+
+static BYOK_KEYS: Lazy<Option<FernetKeys>> = Lazy::new(|| {
+	std::env::var("FERNET_KEY").ok().and_then(|k| decode_fernet_key(&k).ok())
+});
+
+fn decode_fernet_key(key_b64: &str) -> Result<FernetKeys, ProxyError> {
+	let decoded = URL_SAFE
+		.decode(key_b64)
+		.map_err(|e| ProxyError::ProcessingString(format!("FERNET_KEY base64 decode failed: {e}")))?;
+	if decoded.len() != 32 {
+		return Err(ProxyError::ProcessingString(format!(
+			"FERNET_KEY must decode to 32 bytes, got {}",
+			decoded.len()
+		)));
+	}
+	let mut signing = [0u8; 16];
+	let mut encryption = [0u8; 16];
+	signing.copy_from_slice(&decoded[0..16]);
+	encryption.copy_from_slice(&decoded[16..32]);
+	Ok(FernetKeys {
+		signing,
+		encryption,
+	})
+}
+
+fn decrypt_fernet(keys: &FernetKeys, token: &str) -> Result<String, ProxyError> {
+	let decoded = URL_SAFE
+		.decode(token)
+		.map_err(|e| ProxyError::ProcessingString(format!("BYOK token base64 decode failed: {e}")))?;
+	if decoded.len() < 1 + 8 + 16 + 32 {
+		return Err(ProxyError::ProcessingString("BYOK token too short".to_string()));
+	}
+	// Fernet format: version (1) | timestamp (8) | IV (16) | ciphertext (N) | HMAC (32)
+	// split_at(len-32) gives: msg = everything except last 32 bytes, sig = last 32 bytes (HMAC)
+	let (msg, sig) = decoded.split_at(decoded.len() - 32);
+	if msg[0] != 0x80 {
+		return Err(ProxyError::ProcessingString("BYOK token version invalid".to_string()));
+	}
+
+	// HMAC verification
+	type HmacSha256 = Hmac<Sha256>;
+	let mut mac = HmacSha256::new_from_slice(&keys.signing)
+		.map_err(|e| ProxyError::ProcessingString(format!("HMAC init failed: {e}")))?;
+	mac.update(msg);
+	let computed = mac.finalize().into_bytes();
+	if computed.ct_eq(sig).unwrap_u8() != 1 {
+		return Err(ProxyError::ProcessingString("BYOK token signature invalid".to_string()));
+	}
+
+	// Decrypt AES-128-CBC with PKCS7
+	let iv = &msg[1 + 8..1 + 8 + 16];
+	let ciphertext = &msg[1 + 8 + 16..];
+	let mut buf = ciphertext.to_vec();
+	let decrypted = Decryptor::<Aes128>::new_from_slices(&keys.encryption, iv)
+		.map_err(|e| ProxyError::ProcessingString(format!("BYOK decrypt init failed: {e}")))?
+		.decrypt_padded_mut::<Pkcs7>(&mut buf)
+		.map_err(|e| ProxyError::ProcessingString(format!("BYOK decrypt failed: {e}")))?;
+
+	String::from_utf8(decrypted.to_vec())
+		.map_err(|e| ProxyError::ProcessingString(format!("BYOK key not valid UTF-8: {e}")))
+}
+
+fn inject_byok_if_needed(
+	inputs: &ProxyInputs,
+	backend_metadata: Option<&HashMap<Strng, serde_json::Value>>,
+	req: &mut Request,
+	_log: Option<&mut RequestLog>,
+) -> Result<(), ProxyError> {
+	let Some(metadata) = backend_metadata else {
+		return Ok(());
+	};
+	let provider = match metadata.get("provider").and_then(|v| v.as_str()) {
+		Some(p) if p.ends_with("_byok") => p,
+		_ => return Ok(()),
+	};
+
+	let project_id = req
+		.extensions()
+		.get::<crate::http::jwt::Claims>()
+		.and_then(|c| c.inner.get("project_id"))
+		.and_then(|v| v.as_str())
+		.ok_or_else(|| ProxyError::ProcessingString("BYOK requires project_id claim".to_string()))?;
+
+	let provider_id = metadata
+		.get("external_provider_id")
+		.and_then(|v| v.as_str())
+		.ok_or_else(|| ProxyError::ProcessingString("BYOK backend missing external_provider_id".to_string()))?;
+
+	let key_id = format!("{project_id}:{provider_id}");
+	let creds_guard = inputs.read_byok_credentials();
+	let encrypted = creds_guard
+		.get(&key_id)
+		.cloned()
+		.ok_or_else(|| ProxyError::ProcessingString(format!("BYOK credential not found for {key_id}")))?;
+	drop(creds_guard);
+
+	let keys = BYOK_KEYS
+		.as_ref()
+		.ok_or_else(|| ProxyError::ProcessingString("FERNET_KEY not configured".to_string()))?;
+
+	let api_key = decrypt_fernet(keys, &encrypted)?;
+
+	req.headers_mut().insert(
+		header::AUTHORIZATION,
+		HeaderValue::try_from(format!("Bearer {api_key}"))
+			.map_err(|e| ProxyError::ProcessingString(format!("invalid Authorization header: {e}")))?,
+	);
+
+	trace!(
+		provider = provider,
+		key_id = key_id,
+		"Injected BYOK authorization header"
+	);
+
+	Ok(())
 }
 
 #[cfg(test)]

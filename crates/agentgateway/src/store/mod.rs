@@ -1,5 +1,6 @@
 mod binds;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use binds::{
@@ -27,6 +28,7 @@ pub enum Event<T> {
 pub struct Stores {
 	pub discovery: discovery::StoreUpdater,
 	pub binds: binds::StoreUpdater,
+	pub byok_credentials: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Default for Stores {
@@ -40,6 +42,7 @@ impl Stores {
 		Stores {
 			discovery: discovery::StoreUpdater::new(Arc::new(RwLock::new(discovery::Store::new()))),
 			binds: binds::StoreUpdater::new(Arc::new(RwLock::new(binds::Store::new()))),
+			byok_credentials: Arc::new(RwLock::new(HashMap::new())),
 		}
 	}
 	pub fn read_binds(&self) -> std::sync::RwLockReadGuard<'_, store::BindStore> {
@@ -48,6 +51,16 @@ impl Stores {
 
 	pub fn read_discovery(&self) -> std::sync::RwLockReadGuard<'_, store::DiscoveryStore> {
 		self.discovery.read()
+	}
+
+	pub fn read_byok_credentials(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, String>> {
+		self.byok_credentials.read().expect("byok_credentials poisoned")
+	}
+
+	pub fn write_byok_credentials(
+		&self,
+	) -> std::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
+		self.byok_credentials.write().expect("byok_credentials poisoned")
 	}
 }
 

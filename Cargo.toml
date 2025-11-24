@@ -58,6 +58,13 @@ azure_identity = { version = "0.28", default-features = false }
 azure_core = { version = "0.28", default-features = false }
 typespec_client_core = { default-features = false, version = "0.7.0" }
 base64 = "0.22"
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.5"
+fernet = "0.2"
 bytes = { version = "1.10", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }

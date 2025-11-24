@@ -189,6 +189,13 @@ impl LocalClient {
 		.await?;
 		info!("loaded config from {:?}", self.cfg);
 
+		// Sync BYOK credentials (project_id:external_provider_id -> encrypted key)
+		{
+			let mut byok = self.stores.write_byok_credentials();
+			byok.clear();
+			byok.extend(config.byok_credentials.into_iter());
+		}
+
 		// Sync the state
 		let next_binds =
 			self

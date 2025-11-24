@@ -55,6 +55,7 @@ pub struct NormalizedLocalConfig {
 	// for now
 	pub workloads: Vec<LocalWorkload>,
 	pub services: Vec<Service>,
+	pub byok_credentials: HashMap<String, String>,
 }
 
 #[apply(schema_de!)]
@@ -77,6 +78,9 @@ pub struct LocalConfig {
 	#[serde(default)]
 	#[cfg_attr(feature = "schema", schemars(with = "serde_json::value::RawValue"))]
 	services: Vec<Service>,
+	#[serde(default)]
+	#[cfg_attr(feature = "schema", schemars(with = "HashMap<String, String>"))]
+	byok_credentials: HashMap<String, String>,
 }
 
 #[apply(schema_de!)]
@@ -150,6 +154,8 @@ pub struct LocalRouteBackend {
 	pub backend: LocalBackend,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub policies: Option<LocalBackendPolicies>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub metadata: Option<HashMap<Strng, serde_json::Value>>,
 }
 
 fn default_weight() -> usize {
@@ -842,6 +848,7 @@ async fn convert(
 		policies,
 		workloads,
 		services,
+		byok_credentials,
 	} = i;
 	let mut all_policies = vec![];
 	let mut all_backends = vec![];
@@ -896,6 +903,7 @@ async fn convert(
 		backends: all_backends.into_iter().collect(),
 		workloads,
 		services,
+		byok_credentials,
 	})
 }
 
@@ -1040,7 +1048,8 @@ async fn convert_route(
 			weight: b.weight,
 			backend: bref,
 			inline_policies: policies,
-			metadata: HashMap::new(),
+			// Copy metadata from YAML config for selector-based routing (BYOK project_id, etc.)
+			metadata: b.metadata.clone().unwrap_or_default(),
 		};
 		backend_refs.push(bref);
 		external_backends.extend_from_slice(&backends);

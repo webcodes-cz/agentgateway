@@ -442,6 +442,12 @@ pub struct ProxyInputs {
 	ca: Option<Arc<CaClient>>,
 }
 
+impl ProxyInputs {
+	pub fn read_byok_credentials(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, String>> {
+		self.stores.read_byok_credentials()
+	}
+}
+
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 // Address is a wrapper around either a normal SocketAddr or "bind to localhost on IPv4 and IPv6"
 pub enum Address {
