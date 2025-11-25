@@ -227,6 +227,16 @@ fn select_backend(
 	selected
 }
 
+/// Extracts the BYOK limit remaining value from JWT metadata.
+/// Returns None if the field is missing or cannot be parsed.
+fn byok_limit_remaining_from_claims(claims: &crate::http::jwt::Claims) -> Option<i64> {
+	let metadata = claims.inner.get("metadata")?.as_object()?;
+	let raw = metadata.get("byok_limit_remaining")?;
+	raw.as_i64()
+		.or_else(|| raw.as_f64().map(|f| f as i64))
+		.or_else(|| raw.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
 /// Evaluate a selector expression against request body and backend metadata
 fn evaluate_selector(
 	selector_expr: &Strng,
@@ -992,10 +1002,50 @@ impl HTTPProxy {
 		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req, &self.inputs.metrics)
 			.await?;
 
-		let selected_backend =
+		let selected_backend_ref =
 			select_backend(selected_route.as_ref(), &req, &self.inputs.metrics)
 				.ok_or(ProxyError::NoValidBackends)?;
-		let selected_backend = resolve_backend(selected_backend, self.inputs.as_ref())?;
+		let selected_backend = resolve_backend(selected_backend_ref.clone(), self.inputs.as_ref())?;
+
+		// BYOK limit enforcement: if JWT metadata contains byok_limit_remaining and the
+		// selected backend is a BYOK provider, reject when the limit is exhausted.
+		if let Some(provider) = selected_backend_ref
+			.metadata
+			.get("provider")
+			.and_then(|v| v.as_str())
+		{
+			if provider.ends_with("_byok") {
+				if let Some(claims) = req.extensions().get::<crate::http::jwt::Claims>() {
+					if let Some(limit_remaining) = byok_limit_remaining_from_claims(claims) {
+						if limit_remaining >= 0 && limit_remaining <= 0 {
+							debug!(
+								provider,
+								limit_remaining,
+								"BYOK limit exceeded – rejecting with 429"
+							);
+							return Err(
+								ProxyError::RateLimitExceeded {
+									limit: 0,
+									remaining: 0,
+									reset_seconds: 0,
+								}
+								.into(),
+							);
+						}
+						if limit_remaining >= 0 && limit_remaining <= 10 {
+							debug!(
+								provider,
+								limit_remaining,
+								"BYOK limit nearly exhausted – continuing"
+							);
+						}
+					} else {
+						debug!("BYOK limit not present in JWT metadata; skipping enforcement");
+					}
+				}
+			}
+		}
+
 		let backend_policies = get_backend_policies(
 			self.inputs.as_ref(),
 			&selected_backend.backend,
