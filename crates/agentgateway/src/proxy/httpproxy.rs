@@ -1015,6 +1015,9 @@ impl HTTPProxy {
 			.and_then(|v| v.as_str())
 		{
 			if provider.ends_with("_byok") {
+				// Record BYOK provider for usage tracking
+				log.byok_provider = Some(provider.to_string());
+
 				if let Some(claims) = req.extensions().get::<crate::http::jwt::Claims>() {
 					if let Some(limit_remaining) = byok_limit_remaining_from_claims(claims) {
 						if limit_remaining >= 0 && limit_remaining <= 0 {

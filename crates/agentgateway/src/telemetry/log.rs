@@ -511,6 +511,7 @@ impl RequestLog {
 			inference_pool: None,
 			request_handle: None,
 			response_bytes: 0,
+			byok_provider: None,
 		}
 	}
 }
@@ -568,6 +569,9 @@ pub struct RequestLog {
 	pub request_handle: Option<ActiveHandle>,
 
 	pub response_bytes: u64,
+
+	/// BYOK provider name (e.g., "openai_byok") when request uses a BYOK backend
+	pub byok_provider: Option<String>,
 }
 
 impl RequestLog {
@@ -877,6 +881,7 @@ impl Drop for DropOnLog {
 			("retry.attempt", log.retry_attempt.display()),
 			("error", log.error.quoted()),
 			("duration", Some(dur.as_str().into())),
+			("byok.provider", log.byok_provider.as_deref().map(Into::into)),
 		];
 		if enable_trace && let Some(t) = &log.tracer {
 			t.send(&log, &cel_exec, kv.as_slice())
