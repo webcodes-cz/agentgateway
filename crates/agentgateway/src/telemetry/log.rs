@@ -512,6 +512,7 @@ impl RequestLog {
 			request_handle: None,
 			response_bytes: 0,
 			byok_provider: None,
+			fallback_gateway: None,
 		}
 	}
 }
@@ -572,6 +573,9 @@ pub struct RequestLog {
 
 	/// BYOK provider name (e.g., "openai_byok") when request uses a BYOK backend
 	pub byok_provider: Option<String>,
+
+	/// Fallback gateway URL when request was forwarded (Phase 4.2)
+	pub fallback_gateway: Option<String>,
 }
 
 impl RequestLog {
@@ -882,6 +886,7 @@ impl Drop for DropOnLog {
 			("error", log.error.quoted()),
 			("duration", Some(dur.as_str().into())),
 			("byok.provider", log.byok_provider.as_deref().map(Into::into)),
+			("fallback.gateway", log.fallback_gateway.as_deref().map(Into::into)),
 		];
 		if enable_trace && let Some(t) = &log.tracer {
 			t.send(&log, &cel_exec, kv.as_slice())

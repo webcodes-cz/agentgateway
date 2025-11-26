@@ -54,11 +54,13 @@ impl ProxyResponse {
 			| ProxyError::UpstreamTCPCallFailed(_)
 			| ProxyError::BackendAuthenticationFailed(_)
 			| ProxyError::UpstreamTCPProxy(_) => ProxyResponseReason::UpstreamFailure,
-			ProxyError::RequestTimeout => ProxyResponseReason::Timeout,
+			ProxyError::RequestTimeout | ProxyError::GatewayTimeout => ProxyResponseReason::Timeout,
 			ProxyError::ExtProc(_) => ProxyResponseReason::ExtProc,
 			ProxyError::RateLimitFailed | ProxyError::RateLimitExceeded { .. } => {
 				ProxyResponseReason::RateLimit
 			},
+			ProxyError::BadGateway(_) => ProxyResponseReason::UpstreamFailure,
+			ProxyError::Internal(_) => ProxyResponseReason::Internal,
 		}
 	}
 	pub fn downcast(self) -> ProxyError {
@@ -173,6 +175,12 @@ pub enum ProxyError {
 	InvalidRequest,
 	#[error("request upgrade failed, backend tried {1:?} but {0:?} was requested")]
 	UpgradeFailed(Option<HeaderValue>, Option<HeaderValue>),
+	#[error("gateway timeout")]
+	GatewayTimeout,
+	#[error("bad gateway: {0}")]
+	BadGateway(String),
+	#[error("internal error: {0}")]
+	Internal(String),
 }
 
 impl ProxyError {
@@ -224,6 +232,11 @@ impl ProxyError {
 			// Shouldn't happen on this path
 			ProxyError::UpstreamTCPCallFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
 			ProxyError::UpstreamTCPProxy(_) => StatusCode::INTERNAL_SERVER_ERROR,
+
+			// Fallback gateway errors (Phase 4.2)
+			ProxyError::GatewayTimeout => StatusCode::GATEWAY_TIMEOUT,
+			ProxyError::BadGateway(_) => StatusCode::BAD_GATEWAY,
+			ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
 		};
 		let msg = self.to_string();
 		let mut rb = ::http::Response::builder()

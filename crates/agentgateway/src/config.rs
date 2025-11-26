@@ -408,6 +408,11 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 				)
 				.unwrap_or(Duration::from_secs(60 * 5)),
 		}),
+		// Phase 4.2: Fallback gateway configuration
+		fallback_gateway: raw.fallback_gateway.map(|fg| crate::FallbackGateway {
+			url: fg.url,
+			timeout: Duration::from_millis(fg.timeout_ms),
+		}),
 	})
 }
 

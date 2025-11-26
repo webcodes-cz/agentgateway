@@ -105,6 +105,19 @@ pub struct RawConfig {
 	backend: BackendConfig,
 
 	hbone: Option<RawHBONE>,
+
+	/// Fallback gateway for inter-region forwarding when no local backends available
+	fallback_gateway: Option<RawFallbackGateway>,
+}
+
+/// Configuration for gateway-level fallback routing (Phase 4.2)
+#[apply(schema_de!)]
+pub struct RawFallbackGateway {
+	/// URL of the fallback gateway (e.g., "https://api.eu-central-1.inferrouter.com")
+	pub url: String,
+	/// Timeout for fallback requests in milliseconds (default: 30000)
+	#[serde(default = "defaults::fallback_timeout_ms")]
+	pub timeout_ms: u64,
 }
 
 #[apply(schema!)]
@@ -159,6 +172,10 @@ mod defaults {
 	pub fn http1_idle_timeout() -> Duration {
 		// Default to 10 minutes
 		Duration::from_secs(60 * 10)
+	}
+	pub fn fallback_timeout_ms() -> u64 {
+		// Default to 30 seconds for cross-region fallback
+		30000
 	}
 }
 
@@ -333,6 +350,16 @@ impl schemars::JsonSchema for StringBoolFloat {
 	}
 }
 
+/// Runtime configuration for gateway-level fallback (Phase 4.2)
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct FallbackGateway {
+	/// URL of the fallback gateway
+	pub url: String,
+	/// Timeout for fallback requests
+	#[serde(with = "serde_dur")]
+	pub timeout: Duration,
+}
+
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
@@ -359,6 +386,9 @@ pub struct Config {
 	pub threading_mode: ThreadingMode,
 
 	pub backend: BackendConfig,
+
+	/// Fallback gateway for inter-region forwarding (Phase 4.2)
+	pub fallback_gateway: Option<FallbackGateway>,
 }
 
 impl Config {

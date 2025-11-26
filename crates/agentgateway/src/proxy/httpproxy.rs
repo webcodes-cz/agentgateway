@@ -21,7 +21,7 @@ use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace, warn};
 use types::agent::*;
 use types::discovery::*;
 use once_cell::sync::Lazy;
@@ -57,6 +57,167 @@ struct ParsedRequestBody {
 
 const MAX_BODY_SIZE_FOR_SELECTORS: usize = 1024 * 1024; // 1MB
 const BODY_PARSE_TIMEOUT_MS: u64 = 50;
+/// Header to prevent fallback loops (Phase 4.2)
+const FALLBACK_HOP_HEADER: &str = "x-ag-fallback-hop";
+
+/// Forward a request to a fallback gateway when no local backend is available (Phase 4.2)
+///
+/// This function:
+/// 1. Clones the request (method, path, headers, body)
+/// 2. Adds the hop header to prevent loops
+/// 3. Forwards to the fallback gateway URL
+/// 4. Returns the response from the fallback gateway
+async fn forward_to_fallback_gateway(
+	req: Request,
+	fallback: &crate::FallbackGateway,
+	log: &mut crate::telemetry::log::RequestLog,
+	metrics: &Arc<Metrics>,
+) -> Result<Response, crate::proxy::ProxyError> {
+	use http_body_util::BodyExt;
+	use crate::telemetry::metrics::FallbackLabels;
+
+	let fallback_url = &fallback.url;
+	let timeout = fallback.timeout;
+
+	// Extract request parts
+	let (parts, body) = req.into_parts();
+	let method = parts.method;
+	let uri = parts.uri;
+	let headers = parts.headers;
+
+	// Build the full URL for fallback: fallback_url + request path
+	let path_and_query = uri.path_and_query()
+		.map(|pq| pq.as_str())
+		.unwrap_or("/");
+	let full_url = format!("{}{}", fallback_url.trim_end_matches('/'), path_and_query);
+
+	info!(
+		fallback_url = %fallback_url,
+		path = %path_and_query,
+		"Forwarding request to fallback gateway (no local backend available)"
+	);
+
+	// Log fallback in request log
+	log.fallback_gateway = Some(fallback_url.clone());
+
+	// Collect body bytes
+	let body_bytes = match body.collect().await {
+		Ok(collected) => collected.to_bytes(),
+		Err(e) => {
+			warn!(error = ?e, "Failed to collect body for fallback forwarding");
+			return Err(crate::proxy::ProxyError::Internal(format!(
+				"Failed to collect body for fallback: {}",
+				e
+			)));
+		}
+	};
+
+	// Build reqwest client with timeout
+	let client = reqwest::Client::builder()
+		.timeout(timeout)
+		.build()
+		.map_err(|e| crate::proxy::ProxyError::Internal(format!(
+			"Failed to create fallback HTTP client: {}",
+			e
+		)))?;
+
+	// Build the forwarded request
+	let mut req_builder = client.request(
+		reqwest::Method::from_bytes(method.as_str().as_bytes())
+			.unwrap_or(reqwest::Method::POST),
+		&full_url,
+	);
+
+	// Copy headers, adding the hop header
+	for (name, value) in headers.iter() {
+		// Skip hop-by-hop headers and host (will be set by reqwest)
+		if name == "host" || name == "connection" || name == "transfer-encoding" {
+			continue;
+		}
+		if let Ok(value_str) = value.to_str() {
+			req_builder = req_builder.header(name.as_str(), value_str);
+		}
+	}
+
+	// Add hop header to prevent loops
+	req_builder = req_builder.header(FALLBACK_HOP_HEADER, "1");
+
+	// Set body
+	req_builder = req_builder.body(body_bytes.to_vec());
+
+	// Execute request
+	let response = match req_builder.send().await {
+		Ok(resp) => resp,
+		Err(e) => {
+			warn!(error = ?e, fallback_url = %fallback_url, "Fallback gateway request failed");
+			let status = if e.is_timeout() { "timeout" } else { "error" };
+			metrics.gateway_fallback
+				.get_or_create(&FallbackLabels {
+					target_gateway: fallback_url.clone().into(),
+					status: status.to_string().into(),
+				})
+				.inc();
+			if e.is_timeout() {
+				return Err(crate::proxy::ProxyError::GatewayTimeout);
+			}
+			return Err(crate::proxy::ProxyError::BadGateway(format!(
+				"Fallback gateway error: {}",
+				e
+			)));
+		}
+	};
+
+	// Convert reqwest response to our Response type
+	let status = response.status();
+	let resp_headers = response.headers().clone();
+
+	info!(
+		fallback_url = %fallback_url,
+		status = %status,
+		"Received response from fallback gateway"
+	);
+
+	let resp_body = match response.bytes().await {
+		Ok(bytes) => bytes,
+		Err(e) => {
+			warn!(error = ?e, "Failed to read fallback response body");
+			return Err(crate::proxy::ProxyError::BadGateway(format!(
+				"Failed to read fallback response: {}",
+				e
+			)));
+		}
+	};
+
+	// Build our response
+	let mut builder = ::http::Response::builder()
+		.status(::http::StatusCode::from_u16(status.as_u16()).unwrap_or(::http::StatusCode::BAD_GATEWAY));
+
+	for (name, value) in resp_headers.iter() {
+		// Skip hop-by-hop headers
+		if name == "connection" || name == "transfer-encoding" {
+			continue;
+		}
+		builder = builder.header(name.as_str(), value.as_bytes());
+	}
+
+	let response = builder
+		.body(crate::http::Body::from(resp_body.to_vec()))
+		.map_err(|e| crate::proxy::ProxyError::Internal(format!(
+			"Failed to build fallback response: {}",
+			e
+		)))?;
+
+	// Record success metric
+	metrics.gateway_fallback
+		.get_or_create(&FallbackLabels {
+			target_gateway: fallback_url.clone().into(),
+			status: "success".to_string().into(),
+		})
+		.inc();
+
+	Ok(response)
+}
+
 static SELECTORS_ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
 	std::env::var("AG_ENABLE_SELECTORS")
 		.map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
@@ -1002,10 +1163,62 @@ impl HTTPProxy {
 		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req, &self.inputs.metrics)
 			.await?;
 
-		let selected_backend_ref =
-			select_backend(selected_route.as_ref(), &req, &self.inputs.metrics)
-				.ok_or(ProxyError::NoValidBackends)?;
-		let selected_backend = resolve_backend(selected_backend_ref.clone(), self.inputs.as_ref())?;
+		// Phase 4.2: Backend selection with fallback support
+		let maybe_backend = select_backend(selected_route.as_ref(), &req, &self.inputs.metrics);
+
+		let selected_backend_ref = match maybe_backend {
+			Some(backend) => backend,
+			None => {
+				// No local backend available - check for fallback gateway
+				if let Some(fallback) = &self.inputs.cfg.fallback_gateway {
+					// Check hop header to prevent loops (single-hop fallback only)
+					if req.headers().contains_key(FALLBACK_HOP_HEADER) {
+						warn!(
+							"Fallback refused: {} header present (request already forwarded once)",
+							FALLBACK_HOP_HEADER
+						);
+						return Err(ProxyError::NoValidBackends.into());
+					}
+
+					// Forward to fallback gateway and return its response directly
+					info!(
+						fallback_url = %fallback.url,
+						"No local backend available, forwarding to fallback gateway"
+					);
+					let response = forward_to_fallback_gateway(req, fallback, log, &self.inputs.metrics).await?;
+					return Ok(response);
+				}
+
+				// No fallback configured - return error
+				return Err(ProxyError::NoValidBackends.into());
+			}
+		};
+
+		// Phase 4.2: Also handle NoHealthyEndpoints with fallback
+		let selected_backend = match resolve_backend(selected_backend_ref.clone(), self.inputs.as_ref()) {
+			Ok(backend) => backend,
+			Err(ProxyError::NoHealthyEndpoints) => {
+				// All backends are unhealthy - try fallback if configured
+				if let Some(fallback) = &self.inputs.cfg.fallback_gateway {
+					if req.headers().contains_key(FALLBACK_HOP_HEADER) {
+						warn!(
+							"Fallback refused on NoHealthyEndpoints: {} header present",
+							FALLBACK_HOP_HEADER
+						);
+						return Err(ProxyError::NoHealthyEndpoints.into());
+					}
+
+					info!(
+						fallback_url = %fallback.url,
+						"No healthy backends, forwarding to fallback gateway"
+					);
+					let response = forward_to_fallback_gateway(req, fallback, log, &self.inputs.metrics).await?;
+					return Ok(response);
+				}
+				return Err(ProxyError::NoHealthyEndpoints.into());
+			}
+			Err(e) => return Err(e.into()),
+		};
 
 		// BYOK limit enforcement: if JWT metadata contains byok_limit_remaining and the
 		// selected backend is a BYOK provider, reject when the limit is exhausted.

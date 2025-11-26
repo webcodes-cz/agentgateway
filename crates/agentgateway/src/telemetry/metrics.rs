@@ -101,6 +101,13 @@ pub struct SelectorEvalLabels {
 	pub outcome: DefaultedUnknown<RichStrng>,
 }
 
+/// Labels for gateway-level fallback metrics (Phase 4.2)
+#[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct FallbackLabels {
+	pub target_gateway: DefaultedUnknown<RichStrng>,
+	pub status: DefaultedUnknown<RichStrng>,
+}
+
 type Counter = Family<HTTPLabels, counter::Counter>;
 type Histogram<T> = Family<T, prometheus_client::metrics::histogram::Histogram>;
 type TCPCounter = Family<TCPLabels, counter::Counter>;
@@ -118,6 +125,8 @@ pub struct Metrics {
 	pub selector_eval: Family<SelectorEvalLabels, counter::Counter>,
 	pub selector_fallback: Family<SelectorEvalLabels, counter::Counter>,
 	pub selector_body_parse: Family<SelectorBodyParseLabels, counter::Counter>,
+	/// Gateway-level fallback requests (Phase 4.2)
+	pub gateway_fallback: Family<FallbackLabels, counter::Counter>,
 
 	pub mcp_requests: Family<MCPCall, counter::Counter>,
 
@@ -270,6 +279,11 @@ impl Metrics {
 				&mut registry,
 				"selector_body_parse",
 				"Request body parse attempts for selector evaluation",
+			),
+			gateway_fallback: build(
+				&mut registry,
+				"gateway_fallback_requests",
+				"Gateway-level fallback requests to another region (Phase 4.2)",
 			),
 			downstream_connection: build(
 				&mut registry,
