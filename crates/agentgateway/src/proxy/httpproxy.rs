@@ -229,7 +229,44 @@ fn select_backend(
 	req: &Request,
 	metrics: &Arc<Metrics>,
 ) -> Option<RouteBackendReference> {
-	// If JWT contains project_id and BYOK backends are present, prefer only those BYOK backends
+	// Phase 5 Fix: SELECTOR-FIRST, then BYOK filtering
+	//
+	// Order of operations:
+	// 1. Apply selector filter (model matching) - get model-matched backends
+	// 2. Within matched backends, apply BYOK/project filtering
+	// 3. Return result or None (503) - NO fallback to all backends
+
+	// Step 1: Apply selector filter to get model-matched backends
+	let selector_matched = apply_selector_filter(route, req, metrics);
+
+	debug!(
+		total_backends = route.backends.len(),
+		selector_matched = selector_matched.len(),
+		"Backend selection: selector filter applied"
+	);
+
+	// If no backends match selector, return None (will result in 503)
+	if selector_matched.is_empty() {
+		debug!("No backends matched selector - returning None (503)");
+		metrics
+			.selector_eval
+			.get_or_create(&SelectorEvalLabels {
+				route: route.route_name.clone().into(),
+				outcome: "no_match".to_string().into(),
+			})
+			.inc();
+		return None;
+	}
+
+	metrics
+		.selector_eval
+		.get_or_create(&SelectorEvalLabels {
+			route: route.route_name.clone().into(),
+			outcome: "match".to_string().into(),
+		})
+		.inc();
+
+	// Step 2: Apply BYOK filtering within selector-matched backends
 	let project_claim = req
 		.extensions()
 		.get::<crate::http::jwt::Claims>()
@@ -237,35 +274,14 @@ fn select_backend(
 		.and_then(|v| v.as_str());
 
 	if let Some(project_id) = project_claim {
-		// Debug: log all backends and their metadata for BYOK matching
 		debug!(
 			project_id,
-			total_backends = route.backends.len(),
-			"BYOK routing: checking backends for project_id match"
+			selector_matched = selector_matched.len(),
+			"BYOK routing: checking selector-matched backends for project_id"
 		);
-		for (i, b) in route.backends.iter().enumerate() {
-			let meta = &b.metadata;
-			let provider = meta
-				.get("provider")
-				.and_then(|v| v.as_str())
-				.unwrap_or("<none>");
-			let pid = meta
-				.get("project_id")
-				.and_then(|v| v.as_str())
-				.unwrap_or("<none>");
-			debug!(
-				backend_idx = i,
-				provider,
-				backend_project_id = pid,
-				expected_project_id = project_id,
-				is_byok = provider.ends_with("_byok"),
-				pid_match = pid == project_id,
-				"BYOK routing: backend metadata"
-			);
-		}
 
-		let byok_backends: Vec<&RouteBackendReference> = route
-			.backends
+		// Find BYOK backends with matching project_id within selector-matched
+		let byok_matches: Vec<_> = selector_matched
 			.iter()
 			.filter(|b| {
 				let meta = &b.metadata;
@@ -284,34 +300,88 @@ fn select_backend(
 			})
 			.collect();
 
-		if !byok_backends.is_empty() {
+		if !byok_matches.is_empty() {
 			debug!(
 				project_id,
-				total_byok = byok_backends.len(),
+				byok_matches = byok_matches.len(),
 				"BYOK routing: found matching BYOK backends for project"
 			);
-			return byok_backends
+			return byok_matches
 				.choose_weighted(&mut rand::rng(), |b| b.weight)
 				.ok()
-				.cloned()
-				.cloned();
-		} else {
+				.map(|b| (**b).clone());
+		}
+
+		// No BYOK match - use mesh backends (non-BYOK) from selector-matched
+		let mesh_backends: Vec<_> = selector_matched
+			.iter()
+			.filter(|b| {
+				let provider = b.metadata
+					.get("provider")
+					.and_then(|v| v.as_str())
+					.unwrap_or_default();
+				!provider.ends_with("_byok")
+			})
+			.collect();
+
+		if !mesh_backends.is_empty() {
 			debug!(
 				project_id,
-				"BYOK routing: no BYOK backends matched project_id, falling back to regular selection"
+				mesh_backends = mesh_backends.len(),
+				"BYOK routing: no BYOK match, using mesh backends"
 			);
+			return mesh_backends
+				.choose_weighted(&mut rand::rng(), |b| b.weight)
+				.ok()
+				.map(|b| (**b).clone());
 		}
-	} else {
-		debug!("BYOK routing: no project_id claim on request; using regular selection");
+
+		// All selector-matched backends are BYOK but none match project_id
+		debug!(
+			project_id,
+			"BYOK routing: no BYOK or mesh backends available - returning None (503)"
+		);
+		return None;
 	}
 
-	if !*SELECTORS_ENABLED {
-		return route
-			.backends
+	// No project_id claim - filter out BYOK backends, use mesh only
+	debug!("BYOK routing: no project_id claim, filtering to mesh-only backends");
+
+	let mesh_backends: Vec<_> = selector_matched
+		.iter()
+		.filter(|b| {
+			let provider = b.metadata
+				.get("provider")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default();
+			!provider.ends_with("_byok")
+		})
+		.collect();
+
+	if !mesh_backends.is_empty() {
+		debug!(mesh_backends = mesh_backends.len(), "Using mesh backends (no project_id)");
+		return mesh_backends
 			.choose_weighted(&mut rand::rng(), |b| b.weight)
 			.ok()
-			.cloned();
+			.map(|b| (**b).clone());
 	}
+
+	// All backends are BYOK but no project_id - cannot route
+	debug!("No mesh backends available and no project_id - returning None (503)");
+	None
+}
+
+/// Apply selector filter to get model-matched backends
+fn apply_selector_filter<'a>(
+	route: &'a Route,
+	req: &Request,
+	_metrics: &Arc<Metrics>,
+) -> Vec<&'a RouteBackendReference> {
+	if !*SELECTORS_ENABLED {
+		// Selectors disabled - return all backends
+		return route.backends.iter().collect();
+	}
+
 	// Check if route has selector expressions
 	let selectors: Vec<&Strng> = route
 		.matches
@@ -320,19 +390,15 @@ fn select_backend(
 		.collect();
 
 	if selectors.is_empty() {
-		// Fast path: no selectors, use simple weighted selection
-		return route
-			.backends
-			.choose_weighted(&mut rand::rng(), |b| b.weight)
-			.ok()
-			.cloned();
+		// No selectors - return all backends
+		return route.backends.iter().collect();
 	}
 
 	// Get cached parsed body (if available)
 	let parsed_body = req.extensions().get::<ParsedRequestBody>();
 
 	// Filter backends based on selector evaluation
-	let eligible: Vec<_> = route
+	route
 		.backends
 		.iter()
 		.filter(|backend| {
@@ -344,48 +410,7 @@ fn select_backend(
 				evaluate_selector(selector_expr, parsed_body, backend)
 			})
 		})
-		.collect();
-
-	if eligible.is_empty() {
-		// Fallback: no backends matched selectors, use all backends
-		trace!("No backends matched selectors, using all backends as fallback");
-		metrics
-			.selector_eval
-			.get_or_create(&SelectorEvalLabels {
-				route: route.route_name.clone().into(),
-				outcome: "no_match".to_string().into(),
-			})
-			.inc();
-		metrics
-			.selector_fallback
-			.get_or_create(&SelectorEvalLabels {
-				route: route.route_name.clone().into(),
-				outcome: "no_match".to_string().into(),
-			})
-			.inc();
-		return route
-			.backends
-			.choose_weighted(&mut rand::rng(), |b| b.weight)
-			.ok()
-			.cloned();
-	}
-
-	// Select from eligible backends using weighted random
-	let selected = eligible
-		.choose_weighted(&mut rand::rng(), |b| b.weight)
-		.ok()
-		.cloned()
-		.cloned();
-
-	metrics
-		.selector_eval
-		.get_or_create(&SelectorEvalLabels {
-			route: route.route_name.clone().into(),
-			outcome: "match".to_string().into(),
-		})
-		.inc();
-
-	selected
+		.collect()
 }
 
 /// Extracts the BYOK limit remaining value from JWT metadata.
