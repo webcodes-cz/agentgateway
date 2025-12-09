@@ -17,6 +17,8 @@ tls-ring = ["rustls/ring", "tokio-rustls/ring"]
 internal_benches = ["divan"]
 testing = []
 full_tests = []
+# Phase 6B: In-process AuthZ and RateLimit (enables mode: "inproc" in config)
+inproc = ["dep:authz-core", "dep:ratelimit-core"]
 
 [dependencies]
 a2a-sdk.workspace = true
@@ -24,6 +26,9 @@ agent-core.workspace = true
 agent-hbone.workspace = true
 agent-xds.workspace = true
 anyhow.workspace = true
+# Phase 6B: In-process AuthZ and RateLimit
+authz-core = { workspace = true, optional = true }
+ratelimit-core = { workspace = true, optional = true }
 arc-swap.workspace = true
 async-compression.workspace = true
 async-openai.workspace = true

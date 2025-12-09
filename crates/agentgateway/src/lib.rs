@@ -26,7 +26,9 @@ pub mod client;
 pub mod config;
 pub mod control;
 pub mod http;
+pub mod inproc;
 pub mod json;
+pub mod limits;
 pub mod llm;
 pub mod management;
 pub mod mcp;
@@ -108,6 +110,18 @@ pub struct RawConfig {
 
 	/// Fallback gateway for inter-region forwarding when no local backends available
 	fallback_gateway: Option<RawFallbackGateway>,
+
+	/// In-process authorization configuration (Phase 6B)
+	#[serde(default)]
+	authz: inproc::RawAuthzConfig,
+
+	/// In-process rate limiting configuration (Phase 6B)
+	#[serde(default)]
+	rate_limit: inproc::RawRateLimitConfig,
+
+	/// Token limits enforcement configuration
+	#[serde(default)]
+	limits: limits::RawLimitsConfig,
 }
 
 /// Configuration for gateway-level fallback routing (Phase 4.2)
@@ -389,6 +403,18 @@ pub struct Config {
 
 	/// Fallback gateway for inter-region forwarding (Phase 4.2)
 	pub fallback_gateway: Option<FallbackGateway>,
+
+	/// In-process authorization configuration (Phase 6B)
+	#[serde(skip)]
+	pub authz: inproc::AuthzConfig,
+
+	/// In-process rate limiting configuration (Phase 6B)
+	#[serde(skip)]
+	pub rate_limit: inproc::RateLimitConfig,
+
+	/// Token limits enforcement configuration
+	#[serde(skip)]
+	pub limits: limits::LimitsConfig,
 }
 
 impl Config {
@@ -458,7 +484,7 @@ impl ConfigSource {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxyInputs {
 	cfg: Arc<Config>,
 	stores: Stores,
@@ -470,6 +496,28 @@ pub struct ProxyInputs {
 
 	mcp_state: mcp::App,
 	ca: Option<Arc<CaClient>>,
+
+	/// Phase 6B: In-process AuthZ/RateLimit runtime (only with "inproc" feature)
+	#[cfg(feature = "inproc")]
+	pub inproc_runtime: Arc<inproc::InprocRuntime>,
+
+	/// Token limits cache for enforcement
+	pub limits_cache: Arc<limits::LimitsCache>,
+}
+
+impl std::fmt::Debug for ProxyInputs {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ProxyInputs")
+			.field("cfg", &self.cfg)
+			.field("stores", &self.stores)
+			.field("upstream", &self.upstream)
+			.field("metrics", &self.metrics)
+			.field("tracer", &self.tracer)
+			.field("mcp_state", &self.mcp_state)
+			.field("ca", &self.ca)
+			.field("limits_cache", &self.limits_cache)
+			.finish_non_exhaustive()
+	}
 }
 
 impl ProxyInputs {

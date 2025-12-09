@@ -8,6 +8,7 @@ use prometheus_client::registry::Registry;
 use tokio::task::JoinSet;
 
 use crate::control::caclient;
+use crate::limits;
 use crate::telemetry::trc;
 use crate::telemetry::trc::Tracer;
 use crate::{Config, ProxyInputs, client, mcp, proxy, state_manager};
@@ -111,6 +112,39 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	#[cfg(feature = "ui")]
 	info!("serving UI at http://{}/ui", config.admin_addr);
 
+	// Phase 6B: Initialize in-process runtime if enabled
+	#[cfg(feature = "inproc")]
+	let inproc_runtime = Arc::new(crate::inproc::InprocRuntime::new(
+		&config.authz,
+		&config.rate_limit,
+	));
+
+	// Token limits enforcement: Initialize cache and fetch initial snapshot
+	let limits_cache = Arc::new(limits::LimitsCache::new(config.limits.clone()));
+	if limits_cache.is_enabled() {
+		info!("Token limits enforcement: initializing cache");
+		// Try to fetch initial snapshot (fail-open on error)
+		match limits::fetch_full_snapshot(&config.limits).await {
+			Ok(snapshot) => {
+				let count = snapshot.count;
+				limits_cache.update_from_snapshot(snapshot);
+				info!(count, "Token limits cache populated with initial snapshot");
+			}
+			Err(e) => {
+				warn!(error = %e, "Failed to fetch initial limits snapshot, starting without cache");
+				// Continue startup - fail-open
+			}
+		}
+
+		// Spawn background refresh task
+		let limits_cache_clone = limits_cache.clone();
+		tokio::spawn(async move {
+			limits::limits_refresh_task(limits_cache_clone).await;
+		});
+	} else {
+		debug!("Token limits enforcement: disabled");
+	}
+
 	let pi = ProxyInputs {
 		cfg: config.clone(),
 		stores: stores.clone(),
@@ -120,6 +154,11 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 		ca,
 
 		mcp_state: mcp::App::new(stores.clone()),
+
+		#[cfg(feature = "inproc")]
+		inproc_runtime,
+
+		limits_cache,
 	};
 
 	let gw = proxy::Gateway::new(Arc::new(pi), drain_rx.clone());

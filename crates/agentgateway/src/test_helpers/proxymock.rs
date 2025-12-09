@@ -539,8 +539,9 @@ pub fn setup_proxy_test(cfg: &str) -> anyhow::Result<TestBind> {
 	let stores = Stores::new();
 	let client = client::Client::new(&config.dns, None, Default::default(), None);
 	let (drain_tx, drain_rx) = drain::new();
+	let config = Arc::new(config);
 	let pi = Arc::new(ProxyInputs {
-		cfg: Arc::new(config),
+		cfg: config.clone(),
 		stores: stores.clone(),
 		tracer: None,
 		metrics: Arc::new(crate::metrics::Metrics::new(
@@ -551,6 +552,12 @@ pub fn setup_proxy_test(cfg: &str) -> anyhow::Result<TestBind> {
 		ca: None,
 
 		mcp_state: mcp::App::new(stores.clone()),
+
+		#[cfg(feature = "inproc")]
+		inproc_runtime: Arc::new(crate::inproc::InprocRuntime::new(
+			&config.authz,
+			&config.rate_limit,
+		)),
 	});
 	Ok(TestBind {
 		pi,

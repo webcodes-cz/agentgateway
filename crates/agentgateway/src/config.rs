@@ -413,6 +413,11 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 			url: fg.url,
 			timeout: Duration::from_millis(fg.timeout_ms),
 		}),
+		// Phase 6B: In-process AuthZ and RateLimit configuration
+		authz: crate::inproc::AuthzConfig::from(raw.authz),
+		rate_limit: crate::inproc::RateLimitConfig::from(raw.rate_limit),
+		// Token limits enforcement configuration
+		limits: crate::limits::LimitsConfig::from(raw.limits),
 	})
 }
 

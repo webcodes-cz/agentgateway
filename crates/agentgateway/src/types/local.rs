@@ -1041,6 +1041,16 @@ async fn convert_route(
 				port: *port,
 			},
 			LocalBackend::Invalid => BackendReference::Invalid,
+			// For AI backends, use the provider's unique name instead of route key
+			// This ensures each backend has a unique reference for proper routing
+			LocalBackend::AI(ai) => {
+				let backend_name = match ai {
+					LocalAIBackend::Provider(p) => p.name.clone(),
+					// For groups, use route key as fallback (groups share routing)
+					LocalAIBackend::Groups { .. } => key.clone(),
+				};
+				BackendReference::Backend(backend_name)
+			},
 			_ => BackendReference::Backend(key.clone()),
 		};
 		let backends = b.backend.as_backends(bref.name())?;

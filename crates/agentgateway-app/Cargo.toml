@@ -15,6 +15,8 @@ default = ["tls-ring"]
 jemalloc = ["dep:tikv-jemallocator", "agentgateway/jemalloc"]
 schema = ["agentgateway/schema"]
 tls-ring = ["rustls/ring", "tokio-rustls/ring"]
+# Phase 6B: In-process AuthZ and RateLimit
+inproc = ["agentgateway/inproc"]
 
 [dependencies]
 agent-core.workspace = true

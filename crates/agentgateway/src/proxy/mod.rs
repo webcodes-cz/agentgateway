@@ -50,15 +50,21 @@ impl ProxyResponse {
 			ProxyError::AuthorizationFailed | ProxyError::CsrfValidationFailed => {
 				ProxyResponseReason::Authorization
 			},
+			// Phase 6B: In-process authz errors
+			#[cfg(feature = "inproc")]
+			ProxyError::AuthzDenied { .. } => ProxyResponseReason::Authorization,
+			#[cfg(feature = "inproc")]
+			ProxyError::AuthzInternal(_) => ProxyResponseReason::Internal,
 			ProxyError::UpstreamCallFailed(_)
 			| ProxyError::UpstreamTCPCallFailed(_)
 			| ProxyError::BackendAuthenticationFailed(_)
 			| ProxyError::UpstreamTCPProxy(_) => ProxyResponseReason::UpstreamFailure,
 			ProxyError::RequestTimeout | ProxyError::GatewayTimeout => ProxyResponseReason::Timeout,
 			ProxyError::ExtProc(_) => ProxyResponseReason::ExtProc,
-			ProxyError::RateLimitFailed | ProxyError::RateLimitExceeded { .. } => {
-				ProxyResponseReason::RateLimit
-			},
+			ProxyError::RateLimitFailed
+			| ProxyError::RateLimitExceeded { .. }
+			| ProxyError::PaymentRequired { .. } => ProxyResponseReason::RateLimit,
+			ProxyError::ByorForbidden { .. } => ProxyResponseReason::Authorization,
 			ProxyError::BadGateway(_) => ProxyResponseReason::UpstreamFailure,
 			ProxyError::Internal(_) => ProxyResponseReason::Internal,
 		}
@@ -147,6 +153,17 @@ pub enum ProxyError {
 	ExternalAuthorizationFailed(Option<StatusCode>),
 	#[error("authorization failed")]
 	AuthorizationFailed,
+	/// Phase 6B: In-process authz denied
+	#[cfg(feature = "inproc")]
+	#[error("authz denied: {reason}")]
+	AuthzDenied {
+		status: u16,
+		reason: String,
+	},
+	/// Phase 6B: In-process authz internal error
+	#[cfg(feature = "inproc")]
+	#[error("authz internal error: {0}")]
+	AuthzInternal(String),
 	#[error("backend authentication failed: {0}")]
 	BackendAuthenticationFailed(anyhow::Error),
 	#[error("upstream call failed: {0}")]
@@ -171,6 +188,14 @@ pub enum ProxyError {
 	},
 	#[error("rate limit failed")]
 	RateLimitFailed,
+	#[error("payment required: insufficient credits")]
+	PaymentRequired {
+		balance: f64,
+	},
+	#[error("BYOR access denied: gateway restricted to owner")]
+	ByorForbidden {
+		account_id: String,
+	},
 	#[error("invalid request")]
 	InvalidRequest,
 	#[error("request upgrade failed, backend tried {1:?} but {0:?} was requested")]
@@ -218,6 +243,13 @@ impl ProxyError {
 			ProxyError::APIKeyAuthenticationFailure(_) => StatusCode::UNAUTHORIZED,
 			ProxyError::AuthorizationFailed => StatusCode::FORBIDDEN,
 			ProxyError::ExternalAuthorizationFailed(status) => status.unwrap_or(StatusCode::FORBIDDEN),
+			// Phase 6B: In-process authz errors
+			#[cfg(feature = "inproc")]
+			ProxyError::AuthzDenied { status, .. } => {
+				StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN)
+			}
+			#[cfg(feature = "inproc")]
+			ProxyError::AuthzInternal(_) => StatusCode::INTERNAL_SERVER_ERROR,
 
 			ProxyError::DnsResolution => StatusCode::SERVICE_UNAVAILABLE,
 			ProxyError::NoHealthyEndpoints => StatusCode::SERVICE_UNAVAILABLE,
@@ -228,6 +260,8 @@ impl ProxyError {
 			ProxyError::ProcessingString(_) => StatusCode::SERVICE_UNAVAILABLE,
 			ProxyError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
 			ProxyError::RateLimitFailed => StatusCode::TOO_MANY_REQUESTS,
+			ProxyError::PaymentRequired { .. } => StatusCode::PAYMENT_REQUIRED,
+			ProxyError::ByorForbidden { .. } => StatusCode::FORBIDDEN,
 
 			// Shouldn't happen on this path
 			ProxyError::UpstreamTCPCallFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,

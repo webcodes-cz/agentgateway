@@ -31,8 +31,9 @@ async fn setup() -> (MockServer, Handler) {
 		BackendConfig::default(),
 		None,
 	);
+	let config = Arc::new(config);
 	let pi = Arc::new(ProxyInputs {
-		cfg: Arc::new(config),
+		cfg: config.clone(),
 		stores: stores.clone(),
 		tracer: None,
 		metrics: Arc::new(crate::metrics::Metrics::new(
@@ -43,6 +44,12 @@ async fn setup() -> (MockServer, Handler) {
 		ca: None,
 
 		mcp_state: mcp::router::App::new(stores.clone()),
+
+		#[cfg(feature = "inproc")]
+		inproc_runtime: Arc::new(crate::inproc::InprocRuntime::new(
+			&config.authz,
+			&config.rate_limit,
+		)),
 	});
 
 	let client = PolicyClient { inputs: pi };

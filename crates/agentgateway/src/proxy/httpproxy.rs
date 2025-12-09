@@ -218,11 +218,10 @@ async fn forward_to_fallback_gateway(
 	Ok(response)
 }
 
-static SELECTORS_ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
-	std::env::var("AG_ENABLE_SELECTORS")
-		.map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-		.unwrap_or(false)
-});
+/// Selectors are always enabled in InferRouter fork.
+/// This is a core feature required for correct model routing (Phase 3-5).
+/// Legacy AG_ENABLE_SELECTORS env var is no longer used.
+const SELECTORS_ENABLED: bool = true;
 
 fn select_backend(
 	route: &Route,
@@ -239,9 +238,14 @@ fn select_backend(
 	// Step 1: Apply selector filter to get model-matched backends
 	let selector_matched = apply_selector_filter(route, req, metrics);
 
+	// Log selector-matched backend names for debugging
+	let matched_names: Vec<_> = selector_matched.iter()
+		.map(|b| b.backend.name().to_string())
+		.collect();
 	debug!(
 		total_backends = route.backends.len(),
 		selector_matched = selector_matched.len(),
+		matched_backends = ?matched_names,
 		"Backend selection: selector filter applied"
 	);
 
@@ -325,15 +329,20 @@ fn select_backend(
 			.collect();
 
 		if !mesh_backends.is_empty() {
-			debug!(
-				project_id,
-				mesh_backends = mesh_backends.len(),
-				"BYOK routing: no BYOK match, using mesh backends"
-			);
-			return mesh_backends
+			let selected = mesh_backends
 				.choose_weighted(&mut rand::rng(), |b| b.weight)
 				.ok()
 				.map(|b| (**b).clone());
+			if let Some(ref backend) = selected {
+				debug!(
+					project_id,
+					mesh_backends = mesh_backends.len(),
+					backend_name = ?backend.backend.name(),
+					backend_model = ?backend.metadata.get("model"),
+					"BYOK routing: no BYOK match, selected mesh backend"
+				);
+			}
+			return selected;
 		}
 
 		// All selector-matched backends are BYOK but none match project_id
@@ -377,7 +386,7 @@ fn apply_selector_filter<'a>(
 	req: &Request,
 	_metrics: &Arc<Metrics>,
 ) -> Vec<&'a RouteBackendReference> {
-	if !*SELECTORS_ENABLED {
+	if !SELECTORS_ENABLED {
 		// Selectors disabled - return all backends
 		return route.backends.iter().collect();
 	}
@@ -411,16 +420,6 @@ fn apply_selector_filter<'a>(
 			})
 		})
 		.collect()
-}
-
-/// Extracts the BYOK limit remaining value from JWT metadata.
-/// Returns None if the field is missing or cannot be parsed.
-fn byok_limit_remaining_from_claims(claims: &crate::http::jwt::Claims) -> Option<i64> {
-	let metadata = claims.inner.get("metadata")?.as_object()?;
-	let raw = metadata.get("byok_limit_remaining")?;
-	raw.as_i64()
-		.or_else(|| raw.as_f64().map(|f| f as i64))
-		.or_else(|| raw.as_str().and_then(|s| s.parse::<i64>().ok()))
 }
 
 /// Evaluate a selector expression against request body and backend metadata
@@ -522,7 +521,7 @@ async fn maybe_parse_body_for_selectors(
 	req: &mut Request,
 	metrics: &Arc<Metrics>,
 ) -> Result<(), ProxyError> {
-	if !*SELECTORS_ENABLED {
+	if !SELECTORS_ENABLED {
 		return Ok(());
 	}
 	// Check if any route match has a selector
@@ -1184,6 +1183,95 @@ impl HTTPProxy {
 		)
 		.await?;
 
+		// Phase 6B: In-process AuthZ check
+		#[cfg(feature = "inproc")]
+		{
+			use crate::inproc::{AuthzMode, extract_api_key, is_jwt_validated};
+			use crate::http::jwt::Claims;
+			if self.inputs.cfg.authz.mode == AuthzMode::Inproc {
+				// JWT passthrough: check if JWT policy already validated the request
+				// The JWT policy runs before this check, validates JWT, removes Authorization header,
+				// and inserts Claims into request extensions. If claims exist, JWT auth succeeded.
+				// NOTE: We check extensions, NOT the Authorization header (which is removed by JWT policy).
+				let jwt_validated = is_jwt_validated::<Claims>(req.extensions());
+				debug!(jwt_validated, "inproc authz: checking auth method");
+
+				if jwt_validated {
+					debug!("inproc authz: JWT already validated, passthrough");
+				} else if let Some(api_key) = extract_api_key(req.headers(), &self.inputs.cfg.authz.header) {
+					let decision = self
+						.inputs
+						.inproc_runtime
+						.authz
+						.check_authz(&api_key, &self.inputs.cfg.authz)
+						.await;
+
+					match decision {
+						authz_core::AuthzDecision::Allow { .. } => {
+							debug!(api_key_len = api_key.len(), "inproc authz: allowed");
+						}
+						authz_core::AuthzDecision::Deny { status, reason, .. } => {
+							debug!(api_key_len = api_key.len(), status, %reason, "inproc authz: denied");
+							// Internal errors come as Deny with status 500
+							if status == 500 && self.inputs.cfg.authz.fail_open {
+								warn!(%reason, "inproc authz: internal error (fail-open)");
+							} else {
+								return Err(ProxyError::AuthzDenied { status, reason }.into());
+							}
+						}
+					}
+				} else if !self.inputs.cfg.authz.fail_open {
+					// No API key, no JWT, and fail-closed mode
+					return Err(ProxyError::AuthzDenied {
+						status: 401,
+						reason: "missing API key".to_string(),
+					}
+					.into());
+				}
+			}
+		}
+
+		// Phase 6B: In-process RateLimit check
+		#[cfg(feature = "inproc")]
+		{
+			use crate::inproc::RateLimitMode;
+			if self.inputs.cfg.rate_limit.mode == RateLimitMode::Inproc {
+				// Build descriptors from request context
+				// For now, use a simple model-based descriptor if available
+				let mut descriptors = std::collections::HashMap::new();
+
+				// Extract model from request body if JSON (optional)
+				// Note: Body parsing happens later, so we use path-based heuristics for now
+				if let Some(path) = req.uri().path().strip_prefix("/v1/") {
+					descriptors.insert("endpoint".to_string(), path.to_string());
+				}
+
+				// Use default domain "inferrouter-llm" for LLM requests
+				let domain = "inferrouter-llm";
+				let decision = self
+					.inputs
+					.inproc_runtime
+					.ratelimit
+					.check_ratelimit(domain, &descriptors);
+
+				match decision {
+					ratelimit_core::RateLimitDecision::Allow { current, limit, remaining } => {
+						debug!(current, limit, remaining, "inproc ratelimit: allowed");
+					}
+					ratelimit_core::RateLimitDecision::LimitExceeded { retry_after, limit } => {
+						let reset_seconds = retry_after.as_secs();
+						debug!(limit, reset_seconds, "inproc ratelimit: denied");
+						return Err(ProxyError::RateLimitExceeded {
+							limit: limit as u64,
+							remaining: 0,
+							reset_seconds,
+						}
+						.into());
+					}
+				}
+			}
+		}
+
 		// Parse body if route has selectors (for context-window routing)
 		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req, &self.inputs.metrics)
 			.await?;
@@ -1245,45 +1333,113 @@ impl HTTPProxy {
 			Err(e) => return Err(e.into()),
 		};
 
-		// BYOK limit enforcement: if JWT metadata contains byok_limit_remaining and the
-		// selected backend is a BYOK provider, reject when the limit is exhausted.
-		if let Some(provider) = selected_backend_ref
+		// Token limits enforcement (prepaid caps, BYOK limits, credit balance)
+		// Uses cached limits from backend /internal/limits/snapshot
+		let provider = selected_backend_ref
 			.metadata
 			.get("provider")
-			.and_then(|v| v.as_str())
-		{
-			if provider.ends_with("_byok") {
-				// Record BYOK provider for usage tracking
-				log.byok_provider = Some(provider.to_string());
+			.and_then(|v| v.as_str());
 
-				if let Some(claims) = req.extensions().get::<crate::http::jwt::Claims>() {
-					if let Some(limit_remaining) = byok_limit_remaining_from_claims(claims) {
-						if limit_remaining >= 0 && limit_remaining <= 0 {
+		if provider.map(|p| p.ends_with("_byok")).unwrap_or(false) {
+			// Record BYOK provider for usage tracking
+			log.byok_provider = provider.map(|p| p.to_string());
+		}
+
+		// Extract account_id from JWT claims for BYOR and limits enforcement
+		if let Some(claims) = req.extensions().get::<crate::http::jwt::Claims>() {
+			if let Some(account_id) = crate::limits::extract_account_id_from_claims(&claims.inner) {
+				// BYOR check: verify account owns this gateway (if BYOR mode enabled)
+				if let Err(byor_err) = crate::limits::check_byor_access(
+					&account_id,
+					self.inputs.limits_cache.config(),
+				) {
+					if let crate::limits::LimitError::ByorAccessDenied { .. } = byor_err {
+						debug!(
+							account_id,
+							"BYOR access denied – rejecting with 403"
+						);
+						return Err(
+							ProxyError::ByorForbidden {
+								account_id: account_id.clone(),
+							}
+							.into(),
+						);
+					}
+				}
+
+				// Determine model type from provider
+				let model_type = crate::limits::ModelType::from_provider(provider);
+
+				// Check limits via cache
+				if let Err(limit_err) = crate::limits::check_account_limits(
+					&account_id,
+					model_type,
+					&self.inputs.limits_cache,
+				) {
+					match limit_err {
+						crate::limits::LimitError::PrepaidCapExceeded {
+							reason,
+							daily_used,
+							daily_limit,
+							..
+						} => {
 							debug!(
-								provider,
-								limit_remaining,
+								account_id,
+								reason,
+								daily_used,
+								daily_limit,
+								"Prepaid cap exceeded – rejecting with 429"
+							);
+							return Err(
+								ProxyError::RateLimitExceeded {
+									limit: daily_limit as u64,
+									remaining: 0,
+									reset_seconds: 0, // TODO: calculate from reset_at
+								}
+								.into(),
+							);
+						}
+						crate::limits::LimitError::ByokLimitExceeded {
+							byok_used,
+							byok_limit,
+							..
+						} => {
+							debug!(
+								account_id,
+								byok_used,
+								byok_limit,
 								"BYOK limit exceeded – rejecting with 429"
 							);
 							return Err(
 								ProxyError::RateLimitExceeded {
-									limit: 0,
+									limit: byok_limit as u64,
 									remaining: 0,
 									reset_seconds: 0,
 								}
 								.into(),
 							);
 						}
-						if limit_remaining >= 0 && limit_remaining <= 10 {
+						crate::limits::LimitError::InsufficientCredits { balance } => {
 							debug!(
-								provider,
-								limit_remaining,
-								"BYOK limit nearly exhausted – continuing"
+								account_id,
+								balance,
+								"Insufficient credits – rejecting with 402"
+							);
+							return Err(
+								ProxyError::PaymentRequired {
+									balance,
+								}
+								.into(),
 							);
 						}
-					} else {
-						debug!("BYOK limit not present in JWT metadata; skipping enforcement");
+						crate::limits::LimitError::ByorAccessDenied { .. } => {
+							// Already handled above, but match must be exhaustive
+							unreachable!("BYOR error should be caught above");
+						}
 					}
 				}
+			} else {
+				debug!("No account_id in JWT claims; skipping limits enforcement");
 			}
 		}
 
@@ -2683,5 +2839,295 @@ mod selector_tests {
 
 		// Should match BOTH backends (both can handle 2K)
 		assert_eq!(filtered_2k.len(), 2);
+	}
+}
+
+/// Phase 5 Regression Tests: Selector-first BYOK routing
+///
+/// These tests verify that:
+/// 1. Model selector is applied BEFORE BYOK/project filtering
+/// 2. A request for model X NEVER routes to model Y
+/// 3. BYOK routing operates only on selector-matched backends
+/// 4. Mesh fallback respects model selector
+///
+/// Run with:
+/// ```
+/// cargo test --lib proxy::httpproxy::selector_byok_tests
+/// ```
+#[cfg(test)]
+mod selector_byok_tests {
+	use super::*;
+	use crate::http::jwt::Claims;
+	use crate::types::agent::{PathMatch, RouteMatch};
+	use prometheus_client::registry::Registry;
+	use secrecy::SecretString;
+	use serde_json::{Map, json};
+	use std::collections::HashMap;
+
+	/// Helper to create a backend with model/provider/project metadata
+	fn make_backend(
+		name: &str,
+		model: &str,
+		provider: &str,
+		project_id: Option<&str>,
+	) -> RouteBackendReference {
+		let mut metadata = HashMap::new();
+		metadata.insert("model".into(), json!(model));
+		metadata.insert("provider".into(), json!(provider));
+		if let Some(pid) = project_id {
+			metadata.insert("project_id".into(), json!(pid));
+		}
+		RouteBackendReference {
+			weight: 1,
+			backend: BackendReference::Backend(name.into()),
+			inline_policies: vec![],
+			metadata,
+		}
+	}
+
+	/// Helper to create a route with model-matching selector
+	fn make_route_with_model_selector(backends: Vec<RouteBackendReference>) -> Route {
+		Route {
+			key: "test-model-pin".into(),
+			route_name: "00-llm-chat-completions-model-pin".into(),
+			hostnames: Default::default(),
+			rule_name: None,
+			matches: vec![RouteMatch {
+				headers: vec![],
+				path: PathMatch::PathPrefix("/v1/chat/completions".into()),
+				method: None,
+				query: vec![],
+				selector: Some("request.body.model == backend.metadata.model".into()),
+			}],
+			inline_policies: vec![],
+			backends,
+		}
+	}
+
+	/// Helper to create a request with model in body and optional JWT project_id
+	fn make_request_with_model_and_project(
+		model: &str,
+		project_id: Option<&str>,
+	) -> Request {
+		let mut req = ::http::Request::builder()
+			.uri("/v1/chat/completions")
+			.method("POST")
+			.body(http::Body::empty())
+			.unwrap();
+
+		// Add parsed body with model
+		let parsed = ParsedRequestBody {
+			json: json!({"model": model, "messages": []}),
+		};
+		req.extensions_mut().insert(parsed);
+
+		// Add JWT claims if project_id provided
+		if let Some(pid) = project_id {
+			let mut inner = Map::new();
+			inner.insert("project_id".to_string(), json!(pid));
+			req.extensions_mut().insert(Claims {
+				inner,
+				jwt: SecretString::new("test.jwt.token".into()),
+			});
+		}
+
+		req
+	}
+
+	/// Helper to create test metrics
+	fn test_metrics() -> Arc<Metrics> {
+		Arc::new(Metrics::new(
+			&mut Registry::default(),
+			Default::default(),
+		))
+	}
+
+	/// Test: Model selector filters backends BEFORE BYOK routing is considered
+	///
+	/// Scenario: Request for qwen3-32b with project_a that has BYOK for gpt-4o
+	/// Expected: Route to local qwen3-32b, NOT gpt-4o BYOK
+	#[test]
+	fn test_select_backend_prefers_model_matched_local_over_byok() {
+		let backends = vec![
+			make_backend("qwen3-32b_local", "qwen3-32b", "local_mesh", None),
+			make_backend("gpt-4o_byok", "gpt-4o", "openai_byok", Some("project_a")),
+		];
+		let route = make_route_with_model_selector(backends);
+		let req = make_request_with_model_and_project("qwen3-32b", Some("project_a"));
+		let metrics = test_metrics();
+
+		let result = select_backend(&route, &req, &metrics);
+
+		assert!(result.is_some(), "Should select a backend");
+		let backend = result.unwrap();
+		// Must be qwen3-32b, NOT gpt-4o despite project_a having BYOK
+		assert_eq!(
+			backend.metadata.get("model"),
+			Some(&json!("qwen3-32b")),
+			"Must route to model-matched backend, not BYOK for different model"
+		);
+		assert_eq!(
+			backend.metadata.get("provider"),
+			Some(&json!("local_mesh")),
+			"Must be local mesh backend"
+		);
+	}
+
+	/// Test: Request for model X with only model Y available returns None (503)
+	///
+	/// Scenario: Request for qwen3-32b, only gpt-4o BYOK available
+	/// Expected: None (503 error), NOT route to gpt-4o
+	#[test]
+	fn test_select_backend_does_not_route_to_different_model() {
+		let backends = vec![
+			make_backend("gpt-4o_byok", "gpt-4o", "openai_byok", Some("project_a")),
+		];
+		let route = make_route_with_model_selector(backends);
+		let req = make_request_with_model_and_project("qwen3-32b", Some("project_a"));
+		let metrics = test_metrics();
+
+		let result = select_backend(&route, &req, &metrics);
+
+		// Must be None (503), NOT gpt-4o
+		assert!(
+			result.is_none(),
+			"Must return None when no backend matches requested model"
+		);
+	}
+
+	/// Test: When same model has both local and BYOK, BYOK is preferred for matching project
+	///
+	/// Scenario: Request for gpt-4o with project_a that has BYOK for gpt-4o
+	/// Expected: Route to BYOK gpt-4o (project match)
+	#[test]
+	fn test_select_backend_prefers_byok_when_same_model_and_project() {
+		let backends = vec![
+			make_backend("gpt-4o_local", "gpt-4o", "local_mesh", None),
+			make_backend("gpt-4o_byok", "gpt-4o", "openai_byok", Some("project_a")),
+		];
+		let route = make_route_with_model_selector(backends);
+		let req = make_request_with_model_and_project("gpt-4o", Some("project_a"));
+		let metrics = test_metrics();
+
+		let result = select_backend(&route, &req, &metrics);
+
+		assert!(result.is_some(), "Should select a backend");
+		let backend = result.unwrap();
+		// Should use BYOK since project matches and same model
+		assert_eq!(
+			backend.metadata.get("model"),
+			Some(&json!("gpt-4o")),
+			"Must be gpt-4o model"
+		);
+		assert_eq!(
+			backend.metadata.get("provider"),
+			Some(&json!("openai_byok")),
+			"Should prefer BYOK backend when project matches"
+		);
+	}
+
+	/// Test: When BYOK exists but project doesn't match, fall back to mesh
+	///
+	/// Scenario: Request for gpt-4o with project_b, BYOK exists for project_a only
+	/// Expected: Route to local mesh gpt-4o
+	#[test]
+	fn test_select_backend_falls_back_to_mesh_when_byok_project_mismatch() {
+		let backends = vec![
+			make_backend("gpt-4o_local", "gpt-4o", "local_mesh", None),
+			make_backend("gpt-4o_byok", "gpt-4o", "openai_byok", Some("project_a")),
+		];
+		let route = make_route_with_model_selector(backends);
+		let req = make_request_with_model_and_project("gpt-4o", Some("project_b")); // wrong project
+		let metrics = test_metrics();
+
+		let result = select_backend(&route, &req, &metrics);
+
+		assert!(result.is_some(), "Should fall back to mesh backend");
+		let backend = result.unwrap();
+		// Should fallback to local mesh, NOT BYOK with wrong project
+		assert_eq!(
+			backend.metadata.get("model"),
+			Some(&json!("gpt-4o")),
+			"Must be gpt-4o model"
+		);
+		assert_eq!(
+			backend.metadata.get("provider"),
+			Some(&json!("local_mesh")),
+			"Should fall back to mesh when BYOK project doesn't match"
+		);
+	}
+
+	/// Test: When only BYOK exists for a model and project doesn't match, return None
+	///
+	/// Scenario: Request for gpt-4o with project_b, only BYOK for project_a
+	/// Expected: None (503 error) - no mesh fallback available
+	#[test]
+	fn test_select_backend_returns_none_when_only_byok_wrong_project() {
+		let backends = vec![
+			make_backend("gpt-4o_byok", "gpt-4o", "openai_byok", Some("project_a")),
+		];
+		let route = make_route_with_model_selector(backends);
+		let req = make_request_with_model_and_project("gpt-4o", Some("project_b")); // wrong project
+		let metrics = test_metrics();
+
+		let result = select_backend(&route, &req, &metrics);
+
+		// No mesh fallback, wrong project for BYOK
+		assert!(
+			result.is_none(),
+			"Must return None when only BYOK exists and project doesn't match"
+		);
+	}
+
+	/// Test: Request without project_id only uses mesh backends
+	///
+	/// Scenario: Request for gpt-4o with no JWT/project_id
+	/// Expected: Route to mesh backend only, ignore BYOK
+	#[test]
+	fn test_select_backend_uses_mesh_only_when_no_project() {
+		let backends = vec![
+			make_backend("gpt-4o_local", "gpt-4o", "local_mesh", None),
+			make_backend("gpt-4o_byok", "gpt-4o", "openai_byok", Some("project_a")),
+		];
+		let route = make_route_with_model_selector(backends);
+		let req = make_request_with_model_and_project("gpt-4o", None); // no project
+		let metrics = test_metrics();
+
+		let result = select_backend(&route, &req, &metrics);
+
+		assert!(result.is_some(), "Should select mesh backend");
+		let backend = result.unwrap();
+		assert_eq!(
+			backend.metadata.get("provider"),
+			Some(&json!("local_mesh")),
+			"Must use mesh backend when no project_id"
+		);
+	}
+
+	/// Test: Mixed scenario - multiple models, multiple providers
+	///
+	/// Scenario: 3 backends (qwen local, gpt-4o local, gpt-4o BYOK), request qwen
+	/// Expected: Route to qwen local only
+	#[test]
+	fn test_select_backend_complex_mixed_scenario() {
+		let backends = vec![
+			make_backend("qwen3-32b_local", "qwen3-32b", "local_mesh", None),
+			make_backend("gpt-4o_local", "gpt-4o", "local_mesh", None),
+			make_backend("gpt-4o_byok", "gpt-4o", "openai_byok", Some("project_a")),
+		];
+		let route = make_route_with_model_selector(backends);
+		let req = make_request_with_model_and_project("qwen3-32b", Some("project_a"));
+		let metrics = test_metrics();
+
+		let result = select_backend(&route, &req, &metrics);
+
+		assert!(result.is_some(), "Should select qwen backend");
+		let backend = result.unwrap();
+		// Must be qwen, not gpt-4o (even though project_a has BYOK for gpt-4o)
+		assert_eq!(
+			backend.metadata.get("model"),
+			Some(&json!("qwen3-32b")),
+			"Must route to requested model only"
+		);
 	}
 }
