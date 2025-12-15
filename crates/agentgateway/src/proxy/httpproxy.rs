@@ -429,29 +429,40 @@ fn evaluate_selector(
 	backend: &RouteBackendReference,
 ) -> bool {
 	let expr = selector_expr.as_str();
+	expr
+		.split("&&")
+		.map(|t| t.trim())
+		.filter(|t| !t.is_empty())
+		.all(|term| evaluate_comparison_term(term, parsed_body, backend))
+}
 
+fn evaluate_comparison_term(
+	expr: &str,
+	parsed_body: Option<&ParsedRequestBody>,
+	backend: &RouteBackendReference,
+) -> bool {
 	// Parse expression: "request.body.max_tokens <= backend.metadata.max_tokens"
 	if let Some((left_expr, op, right_expr)) = parse_comparison_expr(expr) {
 		let left_value = evaluate_expr(&left_expr, parsed_body, backend);
 		let right_value = evaluate_expr(&right_expr, parsed_body, backend);
 
-	match (left_value, right_value) {
-		(Some(ExprValue::Number(l)), Some(ExprValue::Number(r))) => match op {
-			"<=" => l <= r,
-			">=" => l >= r,
-			"<" => l < r,
-			">" => l > r,
-			"==" => (l - r).abs() < f64::EPSILON,
-			_ => true,
-		},
-		(Some(ExprValue::String(l)), Some(ExprValue::String(r))) => {
-			if op == "==" {
-				l == r
-			} else {
-				true
-			}
-		},
-		_ => true, // Can't evaluate, don't filter out this backend
+		match (left_value, right_value) {
+			(Some(ExprValue::Number(l)), Some(ExprValue::Number(r))) => match op {
+				"<=" => l <= r,
+				">=" => l >= r,
+				"<" => l < r,
+				">" => l > r,
+				"==" => (l - r).abs() < f64::EPSILON,
+				_ => true,
+			},
+			(Some(ExprValue::String(l)), Some(ExprValue::String(r))) => {
+				if op == "==" {
+					l == r
+				} else {
+					true
+				}
+			},
+			_ => true, // Can't evaluate, don't filter out this backend
 		}
 	} else {
 		true // Can't parse selector, don't filter
@@ -462,6 +473,93 @@ fn evaluate_selector(
 enum ExprValue {
 	Number(f64),
 	String(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelDecomposition {
+	base_model: String,
+	adapter_id: Option<String>,
+	adapter_account: Option<String>,
+}
+
+fn decompose_model_string(model: &str) -> ModelDecomposition {
+	// Default: treat the requested model as the base model.
+	//
+	// This preserves existing behavior for non-adapter models while enabling
+	// Dynamic LoRA routing by using request.body.__base_model in selectors.
+	let mut result = ModelDecomposition {
+		base_model: model.to_string(),
+		adapter_id: None,
+		adapter_account: None,
+	};
+
+	// Adapter model id format (URL-safe):
+	//   {base_model}.lora-{adapter_slug}.acct-{namespace}
+	//
+	// Example:
+	//   qwen3-32b.lora-legal-v1.acct-abc123
+	let Some(pos) = model.find(".lora-") else {
+		return result;
+	};
+	if pos == 0 {
+		return result;
+	}
+
+	let base = &model[..pos];
+	let rest = &model[pos + 1..]; // drop the leading '.'
+	let mut parts: Vec<&str> = rest.split('.').collect();
+	if parts.is_empty() {
+		return result;
+	}
+
+	let mut account: Option<String> = None;
+	if let Some(last) = parts.last().copied() {
+		if last.starts_with("acct-") {
+			account = Some(last.to_string());
+			parts.pop();
+		}
+	}
+
+	let adapter = if parts.is_empty() {
+		None
+	} else {
+		Some(parts.join("."))
+	};
+
+	result.base_model = base.to_string();
+	result.adapter_id = adapter;
+	result.adapter_account = account;
+	result
+}
+
+fn inject_model_decomposition_fields(json: &mut serde_json::Value) {
+	let Some(obj) = json.as_object_mut() else {
+		return;
+	};
+
+	let Some(model) = obj.get("model").and_then(|m| m.as_str()) else {
+		return;
+	};
+
+	let decomposition = decompose_model_string(model);
+	obj.insert(
+		"__base_model".to_string(),
+		serde_json::Value::String(decomposition.base_model),
+	);
+	let requires_lora = if decomposition.adapter_id.is_some() { 1 } else { 0 };
+	obj.insert("__requires_lora".to_string(), serde_json::json!(requires_lora));
+	if let Some(adapter_id) = decomposition.adapter_id {
+		obj.insert(
+			"__adapter_id".to_string(),
+			serde_json::Value::String(adapter_id),
+		);
+	}
+	if let Some(adapter_account) = decomposition.adapter_account {
+		obj.insert(
+			"__adapter_account".to_string(),
+			serde_json::Value::String(adapter_account),
+		);
+	}
 }
 
 	fn parse_comparison_expr(expr: &str) -> Option<(String, &'static str, String)> {
@@ -508,11 +606,22 @@ enum ExprValue {
 	}
 
 fn selector_is_valid(expr: &str) -> bool {
-	if let Some((left, _, right)) = parse_comparison_expr(expr) {
-		left.starts_with("request.body.") && right.starts_with("backend.metadata.")
-	} else {
-		false
+	let terms: Vec<&str> = expr
+		.split("&&")
+		.map(|t| t.trim())
+		.filter(|t| !t.is_empty())
+		.collect();
+	if terms.is_empty() {
+		return false;
 	}
+
+	terms.iter().all(|term| {
+		if let Some((left, _, right)) = parse_comparison_expr(term) {
+			left.starts_with("request.body.") && right.starts_with("backend.metadata.")
+		} else {
+			false
+		}
+	})
 }
 
 /// Parse request body and cache it in request extensions if route has selectors
@@ -603,7 +712,8 @@ async fn maybe_parse_body_for_selectors(
 	};
 
 	// Try to parse as JSON and cache in extensions
-	if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+	if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+		inject_model_decomposition_fields(&mut json);
 		let parsed = ParsedRequestBody {
 			json,
 		};
@@ -1183,12 +1293,35 @@ impl HTTPProxy {
 		)
 		.await?;
 
+		// Parse body early if route has selectors.
+		//
+		// This enables:
+		// - selector-based backend filtering (model pinning / LoRA gating)
+		// - adapter ACL checks during inproc authz (P3)
+		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req, &self.inputs.metrics)
+			.await?;
+
 		// Phase 6B: In-process AuthZ check
 		#[cfg(feature = "inproc")]
 		{
 			use crate::inproc::{AuthzMode, extract_api_key, is_jwt_validated};
 			use crate::http::jwt::Claims;
 			if self.inputs.cfg.authz.mode == AuthzMode::Inproc {
+				let parsed_body = req.extensions().get::<ParsedRequestBody>();
+				let requires_lora = parsed_body
+					.and_then(|p| p.json.get("__requires_lora"))
+					.and_then(|v| v.as_i64())
+					.unwrap_or(0)
+					== 1;
+				let adapter_account = parsed_body
+					.and_then(|p| p.json.get("__adapter_account"))
+					.and_then(|v| v.as_str());
+				fn normalize_acct(s: &str) -> &str {
+					s.strip_prefix("acct-")
+						.or_else(|| s.strip_prefix("acct_"))
+						.unwrap_or(s)
+				}
+
 				// JWT passthrough: check if JWT policy already validated the request
 				// The JWT policy runs before this check, validates JWT, removes Authorization header,
 				// and inserts Claims into request extensions. If claims exist, JWT auth succeeded.
@@ -1197,6 +1330,44 @@ impl HTTPProxy {
 				debug!(jwt_validated, "inproc authz: checking auth method");
 
 				if jwt_validated {
+					// Enforce Dynamic LoRA adapter ACL for JWT-authenticated requests.
+					if requires_lora {
+						let jwt_account_id = req.extensions().get::<Claims>().and_then(|claims| {
+							claims
+								.inner
+								.get("account_id")
+								.and_then(|v| v.as_str())
+								.or_else(|| {
+									claims
+										.inner
+										.get("metadata")
+										.and_then(|m| m.get("account_id"))
+										.and_then(|v| v.as_str())
+								})
+						});
+
+						let Some(adapter_account) = adapter_account else {
+							return Err(ProxyError::AuthzDenied {
+								status: 403,
+								reason: "adapter model requires acct namespace".to_string(),
+							}
+							.into());
+						};
+						let Some(jwt_account_id) = jwt_account_id else {
+							return Err(ProxyError::AuthzDenied {
+								status: 403,
+								reason: "jwt missing account_id".to_string(),
+							}
+							.into());
+						};
+						if normalize_acct(adapter_account) != normalize_acct(jwt_account_id) {
+							return Err(ProxyError::AuthzDenied {
+								status: 403,
+								reason: "adapter not allowed for this account".to_string(),
+							}
+							.into());
+						}
+					}
 					debug!("inproc authz: JWT already validated, passthrough");
 				} else if let Some(api_key) = extract_api_key(req.headers(), &self.inputs.cfg.authz.header) {
 					let decision = self
@@ -1207,7 +1378,36 @@ impl HTTPProxy {
 						.await;
 
 					match decision {
-						authz_core::AuthzDecision::Allow { .. } => {
+						authz_core::AuthzDecision::Allow { metadata, .. } => {
+							// Dynamic LoRA adapter ACL (P3):
+							// If the request is an adapter model, require that the adapter namespace
+							// matches the authenticated account_id from authz metadata.
+							if requires_lora {
+								let account_id = metadata.get("account_id").map(|s| s.as_str());
+
+								let Some(adapter_account) = adapter_account else {
+									return Err(ProxyError::AuthzDenied {
+										status: 403,
+										reason: "adapter model requires acct namespace".to_string(),
+									}
+									.into());
+								};
+								let Some(account_id) = account_id else {
+									return Err(ProxyError::AuthzDenied {
+										status: 403,
+										reason: "authz missing account_id".to_string(),
+									}
+									.into());
+								};
+
+								if normalize_acct(adapter_account) != normalize_acct(account_id) {
+									return Err(ProxyError::AuthzDenied {
+										status: 403,
+										reason: "adapter not allowed for this account".to_string(),
+									}
+									.into());
+								}
+							}
 							debug!(api_key_len = api_key.len(), "inproc authz: allowed");
 						}
 						authz_core::AuthzDecision::Deny { status, reason, .. } => {
@@ -1271,10 +1471,6 @@ impl HTTPProxy {
 				}
 			}
 		}
-
-		// Parse body if route has selectors (for context-window routing)
-		maybe_parse_body_for_selectors(selected_route.as_ref(), &mut req, &self.inputs.metrics)
-			.await?;
 
 		// Phase 4.2: Backend selection with fallback support
 		let maybe_backend = select_backend(selected_route.as_ref(), &req, &self.inputs.metrics);
@@ -2732,9 +2928,58 @@ mod selector_tests {
 	use super::*;
 
 	#[test]
+	fn decomposes_non_adapter_model() {
+		let d = decompose_model_string("qwen3-32b");
+		assert_eq!(
+			d,
+			ModelDecomposition {
+				base_model: "qwen3-32b".to_string(),
+				adapter_id: None,
+				adapter_account: None,
+			}
+		);
+	}
+
+	#[test]
+	fn decomposes_lora_adapter_model() {
+		let d = decompose_model_string("qwen3-32b.lora-legal-v1.acct-abc123");
+		assert_eq!(d.base_model, "qwen3-32b");
+		assert_eq!(d.adapter_id.as_deref(), Some("lora-legal-v1"));
+		assert_eq!(d.adapter_account.as_deref(), Some("acct-abc123"));
+	}
+
+	#[test]
+	fn injects_decomposition_fields_into_parsed_json() {
+		let mut json = serde_json::json!({
+			"model": "qwen3-32b.lora-legal-v1.acct-abc123",
+			"max_tokens": 16
+		});
+		inject_model_decomposition_fields(&mut json);
+		assert_eq!(
+			json.get("__base_model").and_then(|v| v.as_str()),
+			Some("qwen3-32b")
+		);
+		assert_eq!(
+			json.get("__adapter_id").and_then(|v| v.as_str()),
+			Some("lora-legal-v1")
+		);
+		assert_eq!(
+			json.get("__adapter_account").and_then(|v| v.as_str()),
+			Some("acct-abc123")
+		);
+		assert_eq!(
+			json.get("__requires_lora").and_then(|v| v.as_i64()),
+			Some(1)
+		);
+	}
+
+	#[test]
 	fn validates_selector() {
 		assert!(selector_is_valid(
 			"request.body.max_tokens <= backend.metadata.max_tokens"
+		));
+		assert!(selector_is_valid(
+			"request.body.__base_model == backend.metadata.model && request.body.__requires_lora <= backend.metadata.lora_capable"
 		));
 		assert!(!selector_is_valid("request.body.max_tokens"));
 	}
@@ -2779,6 +3024,43 @@ mod selector_tests {
 
 		// Request with 20K tokens SHOULD match 32K backend
 		assert!(evaluate_selector(&selector.into(), Some(&body), &high_vram));
+	}
+
+	#[test]
+	fn evaluates_lora_requirements_selector() {
+		let body = ParsedRequestBody {
+			json: serde_json::json!({
+				"__base_model": "qwen3-32b",
+				"__requires_lora": 1
+			}),
+		};
+
+		let selector = "request.body.__base_model == backend.metadata.model && request.body.__requires_lora <= backend.metadata.lora_capable";
+
+		let mut non_lora_backend = RouteBackendReference {
+			weight: 1,
+			backend: BackendReference::Invalid,
+			inline_policies: vec![],
+			metadata: std::collections::HashMap::new(),
+		};
+		non_lora_backend.metadata.insert("model".into(), serde_json::json!("qwen3-32b"));
+		non_lora_backend
+			.metadata
+			.insert("lora_capable".into(), serde_json::json!(0));
+
+		let mut lora_backend = RouteBackendReference {
+			weight: 1,
+			backend: BackendReference::Invalid,
+			inline_policies: vec![],
+			metadata: std::collections::HashMap::new(),
+		};
+		lora_backend.metadata.insert("model".into(), serde_json::json!("qwen3-32b"));
+		lora_backend
+			.metadata
+			.insert("lora_capable".into(), serde_json::json!(1));
+
+		assert!(!evaluate_selector(&selector.into(), Some(&body), &non_lora_backend));
+		assert!(evaluate_selector(&selector.into(), Some(&body), &lora_backend));
 	}
 
 	#[test]
