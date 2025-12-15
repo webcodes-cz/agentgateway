@@ -1442,8 +1442,13 @@ impl HTTPProxy {
 
 				// Extract model from request body if JSON (optional)
 				// Note: Body parsing happens later, so we use path-based heuristics for now
-				if let Some(path) = req.uri().path().strip_prefix("/v1/") {
-					descriptors.insert("endpoint".to_string(), path.to_string());
+				let endpoint = if let Some(path) = req.uri().path().strip_prefix("/v1/") {
+					path.to_string()
+				} else {
+					req.uri().path().trim_start_matches('/').to_string()
+				};
+				if !endpoint.is_empty() {
+					descriptors.insert("endpoint".to_string(), endpoint);
 				}
 
 				// Use default domain "inferrouter-llm" for LLM requests
