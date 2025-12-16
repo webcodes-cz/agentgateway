@@ -9,9 +9,11 @@ members = [
     "crates/a2a-sdk",
     "crates/agentgateway",
     "crates/agentgateway-app",
+    "crates/authz-core",
     "crates/core",
     "crates/hbone",
     "crates/mock-server",
+    "crates/ratelimit-core",
     "crates/xds",
     "crates/xtask",
 ]
@@ -235,9 +237,9 @@ frozen-collections = "0.8.0"
 heck = "0.5"
 macro_rules_attribute = "0.2.2"
 
-# Phase 6B: In-process AuthZ and RateLimit
-authz-core = { path = "../sidecar-authz-rs/crates/authz-core" }
-ratelimit-core = { path = "../sidecar-ratelimit-rs/crates/ratelimit-core" }
+# Phase 6B: In-process AuthZ and RateLimit (embedded in workspace)
+authz-core = { path = "crates/authz-core" }
+ratelimit-core = { path = "crates/ratelimit-core" }
 
 # Release optimized but without as many dependencies, suitable for incremental development
 [profile.quick-release]

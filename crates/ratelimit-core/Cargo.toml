@@ -1,0 +1,23 @@
+[package]
+name = "ratelimit-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["InferRouter Team"]
+description = "Core rate limiting library extracted from sidecar-ratelimit-rs"
+license = "Apache-2.0"
+
+[dependencies]
+# Concurrency - lock-free token buckets
+dashmap = "6.0"
+
+# Config parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+# For testing
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }

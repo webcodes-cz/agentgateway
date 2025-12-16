@@ -1,7 +1,10 @@
-/target
+target/
 .vscode
 .idea
 .DS_Store
 .venv
 *.local
 var/
+
+# Keep the workspace root Cargo.lock committed, but ignore accidental crate-local locks
+crates/**/Cargo.lock

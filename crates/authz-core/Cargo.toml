@@ -1,0 +1,35 @@
+[package]
+name = "authz-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["InferRouter Team"]
+description = "Core authorization library extracted from sidecar-authz-rs"
+license = "Apache-2.0"
+
+[dependencies]
+# Async runtime (needed for backhaul HTTP requests)
+tokio = { version = "1", features = ["rt", "time"] }
+
+# HTTP client for backhaul
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Redis for L2 cache (optional)
+redis = { version = "0.27", features = ["aio", "tokio-comp", "connection-manager"] }
+
+# Hashing for API key cache keys
+sha2 = "0.10"
+base16ct = { version = "0.2", features = ["alloc"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
