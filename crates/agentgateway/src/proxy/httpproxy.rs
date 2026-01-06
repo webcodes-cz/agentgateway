@@ -1040,6 +1040,32 @@ impl HTTPProxy {
 		policies: &FrontendPolices,
 		mut req: ::http::Request<Incoming>,
 	) -> Response {
+		// SECURITY: Strip x-ag-fallback-hop header unless from trusted gateway.
+		// This header is used internally for cross-gateway fallback routing.
+		// Without this check, external clients could send the header to bypass auth.
+		if req.headers().contains_key(FALLBACK_HOP_HEADER) {
+			let should_trust = if self.inputs.cfg.trusted_fallback_sources.is_empty() {
+				// No trusted sources configured = strip from everyone (secure default)
+				debug!("Stripping fallback header: no trusted_fallback_sources configured");
+				false
+			} else if let Some(tcp) = connection.get::<TCPConnectionInfo>() {
+				// Check if source IP is in trusted list
+				let source_ip = tcp.peer_addr.ip();
+				let trusted = self.inputs.cfg.trusted_fallback_sources.iter()
+					.any(|net| net.contains(&source_ip));
+				if !trusted {
+					debug!(source_ip = %source_ip, "Stripping fallback header: source not in trusted_fallback_sources");
+				}
+				trusted
+			} else {
+				debug!("Stripping fallback header: could not determine source IP");
+				false
+			};
+			if !should_trust {
+				req.headers_mut().remove(FALLBACK_HOP_HEADER);
+			}
+		}
+
 		let start = Instant::now();
 		let start_time = agent_core::telemetry::render_current_time();
 
@@ -1420,6 +1446,11 @@ impl HTTPProxy {
 							}
 						}
 					}
+				} else if req.headers().contains_key(FALLBACK_HOP_HEADER) {
+					// Fallback request from another gateway - auth was already done by originating gateway
+					// The x-ag-fallback-hop header is added by the fallback mechanism (line 143)
+					// We trust this header because it's only added by agentgateway's internal forwarding
+					debug!("inproc authz: fallback request from trusted gateway, passthrough");
 				} else if !self.inputs.cfg.authz.fail_open {
 					// No API key, no JWT, and fail-closed mode
 					return Err(ProxyError::AuthzDenied {

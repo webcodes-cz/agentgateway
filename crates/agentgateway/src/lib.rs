@@ -111,6 +111,12 @@ pub struct RawConfig {
 	/// Fallback gateway for inter-region forwarding when no local backends available
 	fallback_gateway: Option<RawFallbackGateway>,
 
+	/// IPs allowed to send x-ag-fallback-hop header (for receiving fallback requests)
+	/// If empty/unset, fallback header is stripped from ALL requests (secure default)
+	/// Example: ["37.46.209.209", "10.0.0.0/8"]
+	#[serde(default)]
+	trusted_fallback_sources: Vec<String>,
+
 	/// In-process authorization configuration (Phase 6B)
 	#[serde(default)]
 	authz: inproc::RawAuthzConfig,
@@ -403,6 +409,10 @@ pub struct Config {
 
 	/// Fallback gateway for inter-region forwarding (Phase 4.2)
 	pub fallback_gateway: Option<FallbackGateway>,
+
+	/// Parsed trusted fallback source IPs/CIDRs
+	#[serde(skip)]
+	pub trusted_fallback_sources: Vec<ipnet::IpNet>,
 
 	/// In-process authorization configuration (Phase 6B)
 	#[serde(skip)]

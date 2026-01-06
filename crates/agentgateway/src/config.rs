@@ -413,6 +413,19 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 			url: fg.url,
 			timeout: Duration::from_millis(fg.timeout_ms),
 		}),
+		// Parse trusted fallback source IPs/CIDRs
+		trusted_fallback_sources: raw.trusted_fallback_sources.iter()
+			.filter_map(|s| {
+				// Try parsing as CIDR first, then as single IP (convert to /32 or /128)
+				s.parse::<ipnet::IpNet>()
+					.or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+					.map_err(|e| {
+						tracing::warn!(source = %s, error = ?e, "Invalid trusted_fallback_source, skipping");
+						e
+					})
+					.ok()
+			})
+			.collect(),
 		// Phase 6B: In-process AuthZ and RateLimit configuration
 		authz: crate::inproc::AuthzConfig::from(raw.authz),
 		rate_limit: crate::inproc::RateLimitConfig::from(raw.rate_limit),
